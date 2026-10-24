@@ -1,18 +1,21 @@
 """Behavioral test: ask questions after the context cache is compressed.
 
 Needle facts are placed in WikiText filler. The context alone is prefilled,
-its cache is compressed with uniform PCA, and each question is then fed on
+its cache is compressed with uniform PCA or Lexico, and each question is then fed on
 top of the rebuilt cache. Every configuration uses the same prompts and greedy
-decoding, and the full-cache run is the control.
+decoding, and the full-cache run is the control. Prefill, compression
+(encode + decode, CUDA-synchronized) and per-question generation are timed.
 """
 
 from __future__ import annotations
 
 import argparse
 import random
+import time
 
 import torch
 
+from bench_codecs import synchronize
 from common import (
     DEFAULT_MODEL,
     build_cache,
@@ -21,6 +24,7 @@ from common import (
     load_model,
     wikitext_token_chunks,
 )
+from lexico import LexicoCodec
 from pca_codec import PCACodec
 
 NEEDLES = (
@@ -63,8 +67,10 @@ def main() -> None:
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--basis", default="checkpoints/pca_basis.pt")
     parser.add_argument("--context-tokens", type=int, default=1500)
-    parser.add_argument("--components", type=int, nargs="+", default=[8, 16, 32, 48])
-    parser.add_argument("--bits", type=int, default=8, choices=(8, 16))
+    parser.add_argument("--dictionary", default="checkpoints/lexico_dict.pt")
+    parser.add_argument("--pca", type=int, nargs="*", default=[16, 32, 48], help="PCA components.")
+    parser.add_argument("--lexico", type=int, nargs="*", default=[4, 5, 8, 11], help="Lexico atoms.")
+    parser.add_argument("--bits", type=int, default=8, choices=(8, 16), help="PCA coefficient bits.")
     parser.add_argument("--recent", type=int, default=0, help="Last context tokens kept exact.")
     parser.add_argument(
         "--streams", default="kv", choices=("kv", "k", "v"), help="Which streams to compress."
@@ -75,36 +81,50 @@ def main() -> None:
 
     tokenizer, model, device = load_model(args.model)
     config = kv_config(model)
-    codec = PCACodec(args.basis, device)
-    if codec.model != args.model:
-        raise RuntimeError(f"Basis was fit for {codec.model}; refit for {args.model}.")
+    pca = PCACodec(args.basis, device)
+    lex = LexicoCodec(args.dictionary, device) if args.lexico else None
+    for codec in filter(None, (pca, lex)):
+        if codec.model != args.model:
+            raise RuntimeError(f"Codec was fit for {codec.model}; refit for {args.model}.")
+
+    def timed(fn):
+        synchronize(device)
+        started = time.perf_counter()
+        result = fn()
+        synchronize(device)
+        return result, time.perf_counter() - started
 
     filler_ids = wikitext_token_chunks(tokenizer, "test", args.context_tokens, 1)[0][1:]
     context, qa = build_prompt(tokenizer, tokenizer.decode(filler_ids), args.seed)
     context_ids, _ = split_ids(tokenizer, context, qa[0][0])
     with torch.inference_mode():
-        outputs = model(input_ids=context_ids[None].to(device), use_cache=True)
+        outputs, prefill_time = timed(lambda: model(input_ids=context_ids[None].to(device), use_cache=True))
     keys, values = cache_tensors(outputs.past_key_values)
     keys = [k.clone() for k in keys]
     values = [v.clone() for v in values]
     tokens = context_ids.shape[0]
     full_bytes = tokens * config.fp16_bytes_per_token()
     print(f"context tokens: {tokens}, needles: {len(qa)}, recent exact: {args.recent}, bits: {args.bits}, streams: {args.streams}")
+    print(f"prefill: {prefill_time * 1000:.0f} ms")
 
-    configs: list[tuple[str, list, list, int]] = [("full", keys, values, full_bytes)]
-    for components in args.components:
-        new_keys, new_values, used = codec.compress_cache(
-            keys, values, components, args.bits, exact_recent=args.recent
-        )
+    runs = [(f"pca k={k}", lambda k=k: pca.compress_cache(keys, values, k, args.bits, exact_recent=args.recent))
+            for k in args.pca]
+    runs += [(f"lexico s={s}", lambda s=s: lex.compress_cache(keys, values, s, exact_recent=args.recent))
+             for s in args.lexico]
+    configs: list[tuple[str, list, list, int, float]] = [("full", keys, values, full_bytes, 0.0)]
+    for name, run in runs:
+        with torch.inference_mode():
+            (new_keys, new_values, used), compress_time = timed(run)
         # A stream left exact counts its full FP16 bytes in place of its codes.
         if args.streams == "k":
             new_values, used = values, used // 2 + full_bytes // 2
         elif args.streams == "v":
             new_keys, used = keys, used // 2 + full_bytes // 2
-        configs.append((f"pca k={components}", new_keys, new_values, used))
+        configs.append((name, new_keys, new_values, used, compress_time))
 
-    for name, cfg_keys, cfg_values, used in configs:
+    for name, cfg_keys, cfg_values, used, compress_time in configs:
         correct = 0
+        generate_time = 0.0
         answers = []
         for question, answer in qa:
             head_ids, tail_ids = split_ids(tokenizer, context, question)
@@ -115,18 +135,23 @@ def main() -> None:
                 [k.clone() for k in cfg_keys], [v.clone() for v in cfg_values], model
             )
             with torch.inference_mode():
-                generated = model.generate(
+                generated, elapsed = timed(lambda: model.generate(
                     input_ids=input_ids,
                     attention_mask=torch.ones_like(input_ids),
                     past_key_values=cache,
                     max_new_tokens=args.max_new_tokens,
                     do_sample=False,
                     pad_token_id=tokenizer.eos_token_id,
-                )
+                ))
+            generate_time += elapsed
             reply = tokenizer.decode(generated[0, input_ids.shape[1] :], skip_special_tokens=True).strip()
             correct += answer in reply
             answers.append(f"{answer}->{reply[:12]!r}")
-        print(f"{name:>10}  bytes {used / full_bytes:6.3f}  correct {correct}/{len(qa)}  {' '.join(answers)}")
+        print(
+            f"{name:>12}  bytes {used / full_bytes:6.3f}  correct {correct}/{len(qa)}  "
+            f"compress {compress_time * 1000:6.0f} ms  gen {generate_time / len(qa) * 1000:4.0f} ms/q  "
+            f"{' '.join(answers)}"
+        )
 
 
 if __name__ == "__main__":

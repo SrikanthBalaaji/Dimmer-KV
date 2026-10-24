@@ -235,3 +235,34 @@ $py = "$env:USERPROFILE\.venvs\hashcode\Scripts\python.exe"
 2. H2O scores (per layer, per KV head, GQA summed) via hooks.
 3. Greedy allocator over PCA/Lexico prefixes with byte budget assert; exit test
    = pass-key correct at 20%.
+
+## Progress log (2026-10-24, ~5:45 PM IST): Lexico codec + timing
+
+Working rule from the team: the phase plan is a guide, adapt as results
+demand, and **every benchmark reports time** next to error and bytes.
+
+- `train_lexico.py` finished: 4096 atoms per layer/stream, 1500 steps, ~19 min.
+- `lexico.py`: `LexicoCodec` (OMP, 12-bit coefficients + FP16 scale per vector,
+  3 B/atom + 2 B), shared `uniform_compress` in `common.py`.
+- `bench_codecs.py`: held-out error, bytes, encode/decode ms per 1K tokens.
+- `test_generation.py`: `--pca` / `--lexico` lists, prefill/compress/generate times.
+
+Held-out (2,044 tokens, all layers, K+V, RTX 5060 laptop):
+
+| codec | B/vec | ratio | key err | val err | enc ms/1K tok | dec ms/1K tok |
+|---|---|---|---|---|---|---|
+| PCA k=16 int8 | 18 | 0.141 | 0.171 | 0.460 | 18 | 11 |
+| PCA k=32 int8 | 34 | 0.266 | 0.065 | 0.256 | 14 | 9 |
+| PCA k=48 int8 | 50 | 0.391 | 0.019 | 0.109 | 26 | 15 |
+| Lexico s=4 | 14 | 0.109 | 0.110 | 0.263 | 287 | 9 |
+| Lexico s=5 | 17 | 0.133 | 0.088 | 0.209 | 359 | 10 |
+| Lexico s=8 | 26 | 0.203 | 0.047 | 0.104 | 581 | 12 |
+| Lexico s=11 | 35 | 0.273 | 0.025 | 0.050 | 838 | 15 |
+
+Needle (6 facts, 1,588-token context, question after compression, uniform):
+PCA k=16/32/48 -> 0/0/4 of 6; Lexico s=4/5/8/11 -> 0/0/3/5 of 6.
+Compress time for the whole context: PCA ~10 ms, Lexico 0.6-1.4 s
+(prefill itself ~0.5 s). Lexico wins quality at equal bytes by a wide margin
+but encode is ~40-60x slower than PCA; decode cost is the same.
+Per-question generate times are not comparable yet (first call includes
+warm-up; wrong answers stop early).

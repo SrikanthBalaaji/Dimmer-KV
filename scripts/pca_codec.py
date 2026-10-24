@@ -13,6 +13,8 @@ from pathlib import Path
 
 import torch
 
+from common import uniform_compress
+
 SCALE_BYTES = 2
 
 
@@ -120,16 +122,29 @@ class PCACodec:
         basis = stream.basis[:, :components].to(coefficients.dtype)
         return coefficients @ basis + mean
 
+    def encode_codes(
+        self, vectors: torch.Tensor, layer: int, kind: str, components: int, bits: int
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Stored code: (INT8 codes, FP16 scale) or (FP16 coefficients, None)."""
+        coefficients = self.encode(vectors, layer, kind, components)
+        if bits == 8:
+            return quantize_int8(coefficients)
+        if bits == 16:
+            return coefficients.half(), None
+        raise ValueError("bits must be 8 or 16")
+
+    def decode_codes(
+        self, codes: tuple[torch.Tensor, torch.Tensor | None], layer: int, kind: str, dtype: torch.dtype
+    ) -> torch.Tensor:
+        values, scale = codes
+        coefficients = values.to(dtype) if scale is None else dequantize_int8(values, scale, dtype)
+        return self.decode(coefficients, layer, kind)
+
     def round_trip(
         self, vectors: torch.Tensor, layer: int, kind: str, components: int, bits: int
     ) -> torch.Tensor:
-        coefficients = self.encode(vectors, layer, kind, components)
-        if bits == 8:
-            codes, scale = quantize_int8(coefficients)
-            coefficients = dequantize_int8(codes, scale, coefficients.dtype)
-        elif bits != 16:
-            raise ValueError("bits must be 8 or 16")
-        return self.decode(coefficients, layer, kind)
+        codes = self.encode_codes(vectors, layer, kind, components, bits)
+        return self.decode_codes(codes, layer, kind, vectors.dtype)
 
     def compress_cache(
         self,
@@ -148,25 +163,11 @@ class PCACodec:
         """
         if len(keys) != self.layers or len(values) != self.layers:
             raise ValueError("The cache layer count does not match the PCA basis.")
-        prefix = self.skip_prefix if exact_prefix is None else exact_prefix
-        tokens = keys[0].shape[-2]
-        start, end = min(prefix, tokens), max(min(prefix, tokens), tokens - exact_recent)
-        exact_tokens = tokens - (end - start)
-
-        def compress(tensors: list[torch.Tensor], kind: str) -> list[torch.Tensor]:
-            out = []
-            for layer, tensor in enumerate(tensors):
-                rebuilt = tensor.clone()
-                if end > start:
-                    rebuilt[..., start:end, :] = self.round_trip(
-                        tensor[..., start:end, :], layer, kind, components, bits
-                    )
-                out.append(rebuilt)
-            return out
-
-        heads = keys[0].shape[-3] * keys[0].shape[0]
-        per_stream = self.layers * heads * (
-            (end - start) * bytes_per_vector(components, bits)
-            + exact_tokens * self.head_dim * 2
+        return uniform_compress(
+            keys,
+            values,
+            lambda tensor, layer, kind: self.round_trip(tensor, layer, kind, components, bits),
+            bytes_per_vector(components, bits),
+            self.skip_prefix if exact_prefix is None else exact_prefix,
+            exact_recent,
         )
-        return compress(keys, "key"), compress(values, "value"), 2 * per_stream
