@@ -155,6 +155,57 @@ With `flat`, easy tokens get 2–4 atoms and harder tokens 6–11; nothing is
 evicted at 15–20%, so a "never evict" floor changes nothing. 10% memory is a
 cliff for every method tried.
 
+## 4. H2O without eviction, and the question in the prompt
+
+**Dimming instead of evicting does not rescue H2O scores** when the question
+comes after compression (15% memory, 18 questions):
+
+| config | evicted | correct | ans p |
+|---|---|---|---|
+| allocator, H2O scores | 4% | 0/18 | 0.012 |
+| same, never evict (≥1 atom) | 0% | 0/18 | 0.011 |
+| same, ≥3 atoms | 0% | 1/18 | 0.011 |
+| H2O softened (score^0.3), ≥1 atom | 0% | 6/18 | 0.102 |
+| H2O barely on (score^0.1), ≥1 atom | 0% | 10/18 | 0.219 |
+| no scores (flat) | 0% | 10/18 | 0.269 |
+
+The more weight H2O gets, the worse the result. The damage comes from where
+bytes go, not from eviction: the facts are low-scored, so they get 1–3 atoms
+while well-attended filler gets 8–16.
+
+**With the question in the prompt** (`--mode prompt`: the question is at the
+end of the text the model reads before compression; one prefill and
+compression per question), we added a SnapKV-style score (`snap`) that
+counts attention from only the last 32 queries, where the question is:
+
+| memory | config | correct | ans p | compress ms |
+|---|---|---|---|---|
+| 10% | uniform Lexico 3 | 1/18 | 0.010 | 344 |
+| | SnapKV eviction (keep 8% exact) | 12/18 | 0.381 | 22 |
+| | allocator, flat | 4/18 | 0.120 | 2399 |
+| | **allocator, snap scores** | **14/18** | **0.570** | 2452 |
+| 15% | uniform Lexico 5 | 7/18 | 0.106 | 615 |
+| | H2O eviction (summed scores) | 1/18 | 0.016 | 40 |
+| | SnapKV eviction (keep 13% exact) | 10/18 | 0.404 | 24 |
+| | allocator, summed H2O scores | 4/18 | 0.088 | 2454 |
+| | **allocator, snap scores** | **17/18** | **0.912** | 2443 |
+| | allocator, snap scores, never evict | 15/18 | 0.809 | 2446 |
+| | allocator, flat | 13/18 | 0.482 | 2423 |
+
+What this shows:
+
+- **With the question visible, the original DimmerKV idea works and is the
+  best config we have:** question-window scores plus graded Lexico levels
+  beat SnapKV-style eviction at the same bytes (17 vs 10/18 at 15%; 14 vs
+  12/18 at 10%). Graded levels beat keep-or-drop.
+- **Summed H2O scores are poor even here**: the question is ~20 of ~1,600
+  queries, so it barely moves the sum. The score signal is what matters,
+  not the allocator.
+- **Without a question, flat is right; with one, question-window scores win
+  by a wide margin.** That suggests one system: compress with flat when the
+  context arrives, and re-allocate or refine with question-window scores
+  when a question comes in.
+
 ## Caveats
 
 - One small model, ~1.6K-token contexts, synthetic needles, 18 questions.
@@ -177,8 +228,9 @@ cliff for every method tried.
    question time; might move the 10% cliff.
 3. **Refine on demand** (plan extension 3): when the question arrives, score
    the compressed tokens against it and fetch exact copies of the top few
-   from CPU memory. This is where attention scores become useful again.
-   CPU-side bytes must be reported separately.
+   from CPU memory. Section 4 shows question-window scores are an excellent
+   signal (17/18 at 15% when available before compression), so this is now
+   the most promising extension. CPU-side bytes must be reported separately.
 4. **Wider checks**: perplexity, 4K contexts, more needles, then the main runs
    on the big GPU.
 5. **Demo and pitch**: update the "H2O vs DimmerKV" story and the per-token

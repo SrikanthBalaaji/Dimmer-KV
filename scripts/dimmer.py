@@ -24,7 +24,9 @@ OMP_CHUNK = 16384
 @dataclass
 class _State:
     scoring: bool = False
+    window: int = 32
     scores: dict[int, torch.Tensor] = field(default_factory=dict)
+    window_scores: dict[int, torch.Tensor] = field(default_factory=dict)
     evicted: dict[int, torch.Tensor] = field(default_factory=dict)
 
 
@@ -58,6 +60,9 @@ def dimmer_attention(module, query, key, value, attention_mask, scaling, dropout
         # that share its KV head (GQA): [kv_heads, keys].
         received = probabilities[0].sum(dim=1)
         STATE.scores[module.layer_idx] = received.view(-1, groups, received.shape[-1]).sum(dim=1)
+        # SnapKV-style: only the last ``window`` queries (where a question would be).
+        recent = probabilities[0, :, -STATE.window :].sum(dim=1)
+        STATE.window_scores[module.layer_idx] = recent.view(-1, groups, recent.shape[-1]).sum(dim=1)
     output = torch.matmul(probabilities.to(query.dtype), value_states)
     return output.transpose(1, 2).contiguous(), None
 
@@ -73,19 +78,27 @@ def set_eviction(evicted: list[torch.Tensor] | None) -> None:
     STATE.evicted = {} if evicted is None else dict(enumerate(evicted))
 
 
-def prefill_with_scores(model, input_ids: torch.Tensor):
-    """Prefill [1, tokens]; return (cache, per-layer H2O scores [kv_heads, tokens]).
+def prefill_with_scores(model, input_ids: torch.Tensor, window: int = 32):
+    """Prefill [1, tokens]; return (cache, scores).
 
-    The score is H2O's accumulated attention each token received.
+    ``scores["sum"]`` is H2O's accumulated attention each token received from
+    all queries; ``scores["snap"]`` counts only the last ``window`` queries
+    (SnapKV-style observation window). Each is a per-layer list of
+    [kv_heads, tokens].
     """
     set_eviction(None)
-    STATE.scores = {}
+    STATE.scores, STATE.window_scores = {}, {}
+    STATE.window = window
     STATE.scoring = True
     try:
         outputs = model(input_ids=input_ids, use_cache=True)
     finally:
         STATE.scoring = False
-    return outputs.past_key_values, [STATE.scores[layer] for layer in range(len(STATE.scores))]
+    layers = range(len(STATE.scores))
+    return outputs.past_key_values, {
+        "sum": [STATE.scores[layer] for layer in layers],
+        "snap": [STATE.window_scores[layer] for layer in layers],
+    }
 
 
 def mean_scores(scores: list[torch.Tensor]) -> list[torch.Tensor]:

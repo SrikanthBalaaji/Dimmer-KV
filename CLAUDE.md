@@ -345,3 +345,40 @@ answer tokens sit at the 31-35th percentile of H2O scores (mean-normalized:
 Lexico at 22%; at 20% it beats uniform at 22% by 5 needles. floor1 changes
 nothing (flat never evicts). 10% is a cliff for every method.
 Cost: compress ~2.4 s per 1.6K-token context (OMP to 16 atoms on every slot).
+
+## Progress log (2026-10-24, ~7:45 PM IST): H2O without eviction; question in prompt
+
+- H2O-scored allocation with no eviction (floor1/2/3) still 0-1/18 in
+  `after` mode; the more weight H2O gets (pow 1 -> 0.3 -> 0.1 -> flat), the
+  better the score (0 -> 6 -> 10 -> 10/18). Eviction was not the problem;
+  H2O moves atoms away from facts (logs/needle_h2o_noevict.log).
+- New: `--mode prompt` (question at the end of the prefilled text, one
+  prefill + compression per question) and `snap` scores (attention from the
+  last 32 queries only, SnapKV-style; `prefill_with_scores` returns
+  {"sum", "snap"}).
+
+Question in prompt, 18 questions (logs/needle_prompt_mode.log):
+
+| config | bytes | correct | ans p | compress ms |
+|---|---|---|---|---|
+| lex3 | 0.105 | 1/18 | 0.010 | 344 |
+| h2o:0.10:snap (SnapKV eviction) | 0.100 | 12/18 | 0.381 | 22 |
+| dkv:0.10:flat | 0.100 | 4/18 | 0.120 | 2399 |
+| **dkv:0.10:snap** | 0.100 | **14/18** | **0.570** | 2452 |
+| lex5 | 0.151 | 7/18 | 0.106 | 615 |
+| h2o:0.15 (sum) | 0.150 | 1/18 | 0.016 | 40 |
+| h2o:0.15:snap | 0.150 | 10/18 | 0.404 | 24 |
+| dkv:0.15 (sum) | 0.150 | 4/18 | 0.088 | 2454 |
+| **dkv:0.15:snap** | 0.150 | **17/18** | **0.912** | 2443 |
+| dkv:0.15:snap:floor1 | 0.150 | 15/18 | 0.809 | 2446 |
+| dkv:0.15:snap:pow0.3 | 0.150 | 16/18 | 0.715 | 2442 |
+| dkv:0.15:flat | 0.150 | 13/18 | 0.482 | 2423 |
+
+Conclusions: with the question visible, the original DimmerKV idea works
+and is the best config tested: SnapKV-window scores + graded Lexico levels
+(17/18 at 15%, 14/18 at 10%) beat SnapKV-style eviction at equal bytes
+(10/18, 12/18) and error-only allocation. Summed H2O scores stay poor even
+here (question tokens are ~20 of ~1,600 queries). The score signal is what
+matters: summed attention misleads, question attention is excellent, no
+question -> use flat. Natural design: flat by default, re-allocate /
+refine with question-window scores when a question arrives.

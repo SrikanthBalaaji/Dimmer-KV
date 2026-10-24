@@ -1,8 +1,13 @@
 """Behavioral test: ask questions after the context cache is compressed.
 
-Needle facts are placed in WikiText filler. The context alone is prefilled,
-its cache is compressed, and each question is then fed on top of the rebuilt
-cache. Every configuration uses the same prompts and greedy decoding, and the
+Needle facts are placed in WikiText filler. Two modes (``--mode``):
+- ``after`` (main): the context alone is prefilled and compressed; each
+  question is then fed on top of the rebuilt cache, so the compressor cannot
+  know what will be asked.
+- ``prompt``: the question is at the end of the prefilled text (one prefill
+  and compression per question), so scores can see it; only the chat
+  closing tokens come after compression.
+Every configuration uses the same prompts and greedy decoding, and the
 full-cache run is the control.
 
 A configuration is one of:
@@ -13,7 +18,7 @@ A configuration is one of:
   rest) or ``dkv:<budget>`` (DimmerKV allocator over Lexico prefixes), budget
   as a fraction of FP16 KV bytes, with optional ``:`` options ``floor<n>``
   (minimum level, 1 = never evict), ``layer`` / ``head`` budget scope,
-  ``mean`` scores, ``flat`` (ignore scores) or ``pow<x>`` (score ** x),
+  ``mean`` scores, ``snap`` (last-32-query window scores), ``flat`` (ignore scores) or ``pow<x>`` (score ** x),
   ``kw<x>`` key error weight. Example: ``dkv:0.15:flat:floor1``.
 The first token and the last ``--recent`` tokens stay exact in every config.
 
@@ -86,6 +91,17 @@ def split_ids(tokenizer, context: str, question: str) -> tuple[torch.Tensor, tor
     return encode_text(tokenizer, head), encode_text(tokenizer, tail)
 
 
+def split_ids_in_prompt(tokenizer, context: str, question: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Like ``split_ids`` but the question is part of the prefilled part."""
+    rendered = tokenizer.apply_chat_template(
+        [{"role": "user", "content": f"Read this document.\n\n{context}\n\n{question}{SPLIT}"}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    head, tail = rendered.split(SPLIT)
+    return encode_text(tokenizer, head), encode_text(tokenizer, tail)
+
+
 def encode_text(tokenizer, text: str) -> torch.Tensor:
     return tokenizer(text, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
 
@@ -93,7 +109,8 @@ def encode_text(tokenizer, text: str) -> torch.Tensor:
 def parse_allocator(spec: str) -> dict:
     method, budget, *options = spec.split(":")
     plan = {"budget": float(budget), "atom_levels": () if method == "h2o" else dimmer.DEFAULT_ATOM_LEVELS,
-            "floor": 0, "scope": "global", "mean": False, "key_weight": 1.0, "power": 1.0}
+            "floor": 0, "scope": "global", "mean": False, "key_weight": 1.0, "power": 1.0,
+            "snap": False}
     for option in options:
         if option.startswith("floor"):
             plan["floor"] = int(option[5:])
@@ -101,6 +118,8 @@ def parse_allocator(spec: str) -> dict:
             plan["scope"] = option
         elif option == "mean":
             plan["mean"] = True
+        elif option == "snap":
+            plan["snap"] = True
         elif option == "flat":
             plan["power"] = 0.0
         elif option.startswith("pow"):
@@ -131,6 +150,7 @@ def main() -> None:
     parser.add_argument("--seeds", type=int, default=3, help="Contexts (different filler and numbers).")
     parser.add_argument("--recent", type=int, default=32, help="Last context tokens kept exact.")
     parser.add_argument("--max-new-tokens", type=int, default=12)
+    parser.add_argument("--mode", default="after", choices=("after", "prompt"))
     args = parser.parse_args()
 
     tokenizer, model, device = load_model(args.model)
@@ -163,7 +183,8 @@ def main() -> None:
             return codecs["pca"].compress_stream(tensors, kind, size, 8, exact_recent=args.recent)
         return codecs["lex"].compress_stream(tensors, kind, size, exact_recent=args.recent)
 
-    def run_allocator(keys, values, scores, plan):
+    def run_allocator(keys, values, all_scores, plan):
+        scores = all_scores["snap" if plan["snap"] else "sum"]
         if plan["mean"]:
             scores = dimmer.mean_scores(scores)
         # power 0 = flat (allocate by error per byte only); 0 < power < 1 softens H2O.
@@ -197,11 +218,25 @@ def main() -> None:
     stats = {name: {"correct": 0, "agree": 0, "nll": 0.0, "compress": 0.0, "gen": 0.0, "new": 0, "bytes": 0.0,
                     "histogram": {}}
              for name in ["full"] + [n for n, _ in configs]}
-    contexts = wikitext_token_chunks(tokenizer, "test", args.context_tokens, args.seeds)
-    total = 0
-    for seed, filler_ids in enumerate(contexts):
+    # A case is one prefill + compression with the questions asked on top of it.
+    cases = []
+    for seed, filler_ids in enumerate(wikitext_token_chunks(tokenizer, "test", args.context_tokens, args.seeds)):
         context, qa = build_prompt(tokenizer.decode(filler_ids[1:]), seed)
-        context_ids, _ = split_ids(tokenizer, context, qa[0][0])
+        if args.mode == "after":
+            context_ids = split_ids(tokenizer, context, qa[0][0])[0]
+            questions = []
+            for question, answer in qa:
+                head_ids, tail_ids = split_ids(tokenizer, context, question)
+                if not torch.equal(head_ids, context_ids):
+                    raise RuntimeError("Context tokenization changed between questions.")
+                questions.append((tail_ids, answer, encode_text(tokenizer, answer)))
+            cases.append((context_ids, questions))
+        else:
+            for question, answer in qa:
+                head_ids, tail_ids = split_ids_in_prompt(tokenizer, context, question)
+                cases.append((head_ids, [(tail_ids, answer, encode_text(tokenizer, answer))]))
+    total = sum(len(questions) for _, questions in cases)
+    for context_ids, questions in cases:
         context_length = context_ids.shape[0]
         with torch.inference_mode():
             cache, scores = dimmer.prefill_with_scores(model, context_ids[None].to(device))
@@ -216,7 +251,7 @@ def main() -> None:
                     allocation, elapsed = timed(lambda: run_allocator(keys, values, scores, spec))
                     for level, share in allocation.histogram.items():
                         stats[name]["histogram"][level] = (
-                            stats[name]["histogram"].get(level, 0.0) + share / len(contexts)
+                            stats[name]["histogram"].get(level, 0.0) + share / len(cases)
                         )
                     variants.append((name, allocation.keys, allocation.values, allocation.evicted,
                                      elapsed, allocation.used_bytes))
@@ -228,14 +263,6 @@ def main() -> None:
                 )
                 variants.append((name, new_keys, new_values, None, key_time + value_time, key_bytes + value_bytes))
 
-        questions = []
-        for question, answer in qa:
-            head_ids, tail_ids = split_ids(tokenizer, context, question)
-            if not torch.equal(head_ids, context_ids):
-                raise RuntimeError("Context tokenization changed between questions.")
-            questions.append((tail_ids, answer, encode_text(tokenizer, answer)))
-        total += len(questions)
-
         full_replies = []
         with torch.inference_mode():
             ask(keys, values, torch.cat([context_ids, questions[0][0]])[None].to(device))  # Warm-up.
@@ -243,7 +270,7 @@ def main() -> None:
                 dimmer.set_eviction(evicted)
                 entry = stats[name]
                 entry["compress"] += compress_time
-                entry["bytes"] += used / full_bytes / len(contexts)
+                entry["bytes"] += used / full_bytes / len(cases)
                 for index, (tail_ids, answer, answer_ids) in enumerate(questions):
                     input_ids = torch.cat([context_ids, tail_ids])[None].to(device)
                     generated, elapsed = timed(lambda: ask(cfg_keys, cfg_values, input_ids))
@@ -258,7 +285,7 @@ def main() -> None:
                     entry["nll"] += answer_nll(cfg_keys, cfg_values, tail_ids, answer_ids, context_length)
             dimmer.set_eviction(None)
 
-    print(f"seeds: {len(contexts)}, needles: {total}, context ~{args.context_tokens} tokens, "
+    print(f"mode: {args.mode}, seeds: {args.seeds}, needles: {total}, context ~{args.context_tokens} tokens, "
           f"recent exact: {args.recent}, device: {device}")
     print(f"{'config':>12} {'bytes':>6} {'correct':>8} {'agree':>6} {'ans NLL':>8} {'ans p':>6} "
           f"{'compress ms':>11} {'gen ms/tok':>10}")
@@ -266,7 +293,7 @@ def main() -> None:
         nll = entry["nll"] / total
         print(
             f"{name:>12} {entry['bytes']:>6.3f} {entry['correct']:>4}/{total:<3} {entry['agree']:>6} "
-            f"{nll:>8.3f} {math.exp(-nll):>6.3f} {entry['compress'] / len(contexts) * 1000:>11.0f} "
+            f"{nll:>8.3f} {math.exp(-nll):>6.3f} {entry['compress'] / len(cases) * 1000:>11.0f} "
             f"{entry['gen'] / max(entry['new'], 1) * 1000:>10.1f}"
         )
     for name, entry in stats.items():

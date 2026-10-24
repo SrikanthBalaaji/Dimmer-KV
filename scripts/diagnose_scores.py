@@ -58,7 +58,8 @@ def main() -> None:
         context_ids, _ = split_ids(tokenizer, context, qa[0][0])
         positions = answer_positions(tokenizer, context, qa[0][0], [answer for _, answer in qa])
         with torch.inference_mode():
-            cache, scores = dimmer.prefill_with_scores(model, context_ids[None].to(device))
+            cache, all_scores = dimmer.prefill_with_scores(model, context_ids[None].to(device))
+            scores = all_scores["sum"]
             keys = [layer.keys for layer in cache.layers]
             values = [layer.values for layer in cache.layers]
             tokens = context_ids.shape[0]
