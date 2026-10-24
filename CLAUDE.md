@@ -616,3 +616,58 @@ What it shows:
 - **DimmerKV vs kvtc** at equal size: same capacity and speed (+6–7 ms to
   restore), higher answer probability (.78 vs .76 at 3%, .94 vs .89 at 5%).
 
+
+## Progress log (2026-10-25, ~3:30 AM IST): long conversations (8K)
+
+Prefill is now chunked (512 tokens at a time; scores summed across chunks,
+checked against one-pass prefill: identical up to FP16 rounding), so 8K
+contexts fit on the 8 GB laptop. All answering uses the same eager attention
+so decode speeds compare like with like; the recompute baseline prefills in
+1,024-token chunks with PyTorch SDPA, its fastest path here. 4 contexts × 6
+needles = 24 questions, 32 generated tokens per answer, RAM budget 8 GiB.
+Raw rows: `results/serving_8k.csv`, `logs/prompt_8k.log`.
+
+**Serving, question after compression** (~8.1K tokens; FP16 cache 252 MiB):
+
+| way of keeping the conversation | stored | conversations in 8 GiB | restore | time to first token | tokens/s | needles / ans p |
+|---|---|---|---|---|---|---|
+| full cache kept on GPU | 252 MiB (GPU) | — | 2 ms | 35 ms | 46 | 21/24 / .75 |
+| full cache in RAM (FP16) | 252 MiB | 32 | 13 ms | 47 ms | 47 | 21/24 / .75 |
+| recompute (store only text) | ~0 | unlimited | 1,358 ms | 1,384 ms | 45 | 21/24 / .75 |
+| H2O 2% | 5.2 MiB | 1,586 | 0.3 ms* | 34 ms | 46 | **0/24** / .00 |
+| H2O 5% | 12.7 MiB | 643 | 0.8 ms* | 35 ms | 46 | **0/24** / .00 |
+| kvtc filled 2% | 4.5 MiB | 1,808 | 390 ms | 416 ms | 46 | 17/24 / .51 |
+| DimmerKV-kvtc 2% | 4.5 MiB | 1,809 | 386 ms | 423 ms | 46 | 17/24 / .49 |
+| kvtc filled 3% | 6.7 MiB | 1,220 | 403 ms | 433 ms | 46 | 20/24 / .58 |
+| DimmerKV-kvtc 3% | 6.7 MiB | 1,217 | 410 ms | 449 ms | 46 | 20/24 / .58 |
+| kvtc filled 5% | 11.2 MiB | 732 | 438 ms | 471 ms | 46 | 21/24 / .71 |
+| DimmerKV-kvtc 5% | 11.2 MiB | 732 | 445 ms | 478 ms | 46 | **21/24 / .74** |
+
+\* H2O's restore only times the transfer of its kept tokens (see section 9).
+
+**Accuracy, question in the prompt** (24 questions; full cache 21/24, .75):
+
+| method | 2% | 3% |
+|---|---|---|
+| SnapKV | — | 13 / .36 |
+| kvtc filled | 17 / .51 | 21 / .60 |
+| DimmerKV-kvtc flat | 17 / .51 | 21 / .63 |
+| **DimmerKV-kvtc question scores** | **19 / .62** | **22 / .76** |
+
+What it shows:
+
+- The 1B model itself is weaker at 8K tokens (full cache 21/24, .75).
+- **Capacity**: at 5%, DimmerKV-kvtc matches the full cache (21/24) while
+  fitting **23× more conversations** in RAM (732 vs 32); H2O at the same size
+  answers 0/24.
+- **Latency**: first token in ~0.45–0.48 s from the compressed copy, ~3×
+  faster than recomputing (1.38 s); slower than copying an uncompressed cache
+  from RAM (47 ms). Decode speed is unchanged (45–47 tokens/s).
+- **Question visible**: DimmerKV with question scores at 3% matches the full
+  cache (22/24, .76 vs 21/24, .75) where kvtc gets .60 and SnapKV 13/24;
+  at 2% it keeps 19/24 vs 17/24 for kvtc. The strongest DimmerKV result.
+- **Question not visible**: at 8K tokens flat per-token rungs are tied with
+  kvtc (the +.02–.05 gain at 1.6–3K tokens does not carry over).
+- 16K-token run: first attempt ran out of pinned host memory (Windows limit)
+  after the accuracy pass; rerunning with pageable RAM fallback.
+
