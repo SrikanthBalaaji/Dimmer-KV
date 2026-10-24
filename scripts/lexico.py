@@ -26,12 +26,18 @@ def bytes_per_vector(atoms: int) -> int:
 
 
 def omp(
-    vectors: torch.Tensor, dictionary: torch.Tensor, sparsity: int, ridge: float = 1e-6
+    vectors: torch.Tensor,
+    dictionary: torch.Tensor,
+    sparsity: int,
+    ridge: float = 1e-6,
+    errors: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sparse-code [batch, dim] vectors over unit-norm atoms [dim, atoms].
 
     Returns atom indices [batch, sparsity] in selection order and the final
-    least-squares coefficients [batch, sparsity].
+    least-squares coefficients [batch, sparsity]. If ``errors`` is a list, the
+    squared residual norm [batch] before each step and after the last is
+    appended (sparsity + 1 entries): the exact error of every prefix length.
     """
     batch = vectors.shape[0]
     residual = vectors
@@ -39,6 +45,8 @@ def omp(
     eye = torch.eye(sparsity, device=vectors.device, dtype=vectors.dtype)
     coefficients = vectors.new_zeros(batch, 0)
     for step in range(sparsity):
+        if errors is not None:
+            errors.append(residual.square().sum(dim=1))
         correlation = (residual @ dictionary).abs()
         if step:
             correlation.scatter_(1, indices, -1.0)
@@ -48,6 +56,8 @@ def omp(
         target = atoms @ vectors[:, :, None]
         coefficients = torch.linalg.solve(gram, target)[..., 0]
         residual = vectors - (coefficients[:, None] @ atoms)[:, 0]
+    if errors is not None:
+        errors.append(residual.square().sum(dim=1))
     return indices, coefficients
 
 
@@ -90,6 +100,10 @@ class LexicoCodec:
     @property
     def layers(self) -> int:
         return len(self._dictionaries)
+
+    def dictionary(self, layer: int, kind: str) -> torch.Tensor:
+        """Unit-norm atoms [head_dim, atoms] for one layer and stream."""
+        return self._dictionaries[layer][kind]
 
     def encode_codes(
         self, vectors: torch.Tensor, layer: int, kind: str, sparsity: int

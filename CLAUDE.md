@@ -303,3 +303,45 @@ sensitive stream (PCA keys + rich Lexico values collapses to 0/18), but PCA
 values also hurt. Generate time per token is identical across configs because
 Level 1 rebuilds a full FP16 cache; codes only change memory, not decode
 speed. Encode speed is the cost to attack (OMP), not the codec choice.
+
+## Progress log (2026-10-24, ~7:00 PM IST): allocator + H2O baseline
+
+- `scripts/dimmer.py`: custom attention `dimmer` (registered with
+  transformers' AttentionInterface; eager math) that records H2O scores at
+  prefill (attention received, summed over queries and the GQA group) and
+  hides evicted tokens per (layer, KV head) with a mask. `allocate()`: levels
+  per middle (layer, head, token) slot = evict / Lexico {1,2,3,4,6,8,11,16}
+  atoms for K and V / exact; piece value = score x drop in relative K+V error
+  / extra bytes, cummin along levels, stable greedy fill of the byte budget
+  (global, per layer or per head), asserts bytes <= budget. H2O baseline = the
+  same allocator with levels {evict, exact}. Level 1: memory is counted from
+  codes; evicted/compressed slots still sit in the FP16 tensor.
+- `lexico.omp(..., errors=list)` returns the exact error of every prefix.
+- `test_generation.py`: `h2o:<budget>` and `dkv:<budget>[:floorN|layer|head|mean|flat|powX|kwX]`
+  configs, recent window 32 exact for every config (default), level histograms.
+- `diagnose_scores.py`: percentile of needle tokens under each score.
+
+**Key finding: H2O scores do not see post-compression questions.** Needle
+answer tokens sit at the 31-35th percentile of H2O scores (mean-normalized:
+~45th, i.e. random). Allocating by H2O moves bytes *away* from the facts.
+
+18 needles, ~1.6K tokens, 32 recent exact (logs/needle_alloc_v1.log):
+
+| config | bytes | correct | ans p | compress ms |
+|---|---|---|---|---|
+| lex3 (uniform) | 0.105 | 0/18 | 0.002 | 344 |
+| dkv:0.10:flat | 0.100 | 1/18 | 0.010 | 2365 |
+| lex5 (uniform) | 0.151 | 5/18 | 0.030 | 670 |
+| h2o:0.15 | 0.150 | 0/18 | 0.003 | 138 |
+| dkv:0.15 (H2O scores) | 0.150 | 0/18 | 0.012 | 2414 |
+| dkv:0.15:pow0.3 | 0.150 | 6/18 | 0.103 | 2421 |
+| **dkv:0.15:flat** | 0.150 | **10/18** | **0.269** | 2380 |
+| dkv:0.15:flat:kw2 | 0.150 | 8/18 | 0.225 | 2373 |
+| lex8 (uniform) | 0.220 | 9/18 | 0.307 | 949 |
+| **dkv:0.20:flat** | 0.200 | **14/18** | **0.694** | 2374 |
+
+`flat` = ignore scores, allocate atoms by error drop per byte only
+(variable-rate Lexico). At 15% it doubles uniform Lexico and matches uniform
+Lexico at 22%; at 20% it beats uniform at 22% by 5 needles. floor1 changes
+nothing (flat never evicts). 10% is a cliff for every method.
+Cost: compress ~2.4 s per 1.6K-token context (OMP to 16 atoms on every slot).
