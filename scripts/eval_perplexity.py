@@ -93,12 +93,14 @@ def main() -> None:
     parser.add_argument("--context-tokens", type=int, default=1536)
     parser.add_argument("--eval-tokens", type=int, default=512)
     parser.add_argument("--chunks", type=int, default=4)
+    parser.add_argument("--kvtc", default="checkpoints/kvtc.pt", help="fit_kvtc.py output.")
     parser.add_argument("--recent", type=int, default=32)
     args = parser.parse_args()
 
     tokenizer, model, device = load_model(args.model)
     dimmer.install(model)
-    methods = Methods(args.model, args.basis, args.dictionary, device, args.recent)
+    methods = Methods(args.model, args.basis, args.dictionary, device, args.recent,
+                      model=model, kvtc=args.kvtc)
     rows = run_perplexity(model, tokenizer, methods, args.configs, args.context_tokens, args.eval_tokens,
                           args.chunks)
     print(f"chunks: {args.chunks}, context {args.context_tokens} + eval {args.eval_tokens} tokens, "

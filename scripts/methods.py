@@ -6,6 +6,10 @@ A method name is one of:
   a codec is ``pca<k>`` (INT8 PCA, k components), ``lex<s>`` (Lexico, s atoms)
   or ``fp16``. Example: ``pca16/lex8``.
 - ``lex@<budget>``: uniform Lexico with the most atoms that fit the budget.
+- ``kvtc@<budget>``: kvtc transform coding (cross-layer PCA, RoPE removed,
+  grouped bit widths), every token on the same rung; ``dkvtc@<budget>``:
+  the same transform with DimmerKV flat per-token rungs (``kvtc.py``).
+  These keep the first 4 tokens exact (kvtc's sinks) plus the recent window.
 - ``h2o:<budget>`` (keep the highest-scoring tokens exact, evict the rest) or
   ``dkv:<budget>`` (DimmerKV allocator over Lexico prefixes), budget as a
   fraction of FP16 KV bytes, with optional ``:`` options ``floor<n>``
@@ -27,6 +31,7 @@ import torch
 import dimmer
 import lexico
 from bench_codecs import synchronize
+from kvtc import KVTCCodec
 from lexico import LexicoCodec
 from pca_codec import PCACodec
 
@@ -79,8 +84,8 @@ def budget_of(name: str) -> float:
     """Nominal memory budget of a method name (1.0 for full, NaN if implicit)."""
     if name == "full":
         return 1.0
-    if name.startswith("lex@"):
-        return float(name[4:])
+    if "@" in name:
+        return float(name.split("@")[1])
     if name.startswith(("h2o:", "dkv:")):
         return float(name.split(":")[1])
     return float("nan")
@@ -89,18 +94,25 @@ def budget_of(name: str) -> float:
 class Methods:
     """Applies named compression methods to a prefilled cache."""
 
-    def __init__(self, model_id: str, basis: str | Path, dictionary: str | Path, device, recent: int = 32):
+    def __init__(self, model_id: str, basis: str | Path, dictionary: str | Path, device, recent: int = 32,
+                 model=None, kvtc: str | Path = "checkpoints/kvtc.pt"):
         self.model_id = model_id
         self.device = device
         self.recent = recent
-        self._paths = {"pca": Path(basis), "lex": Path(dictionary)}
+        self._model = model
+        self._paths = {"pca": Path(basis), "lex": Path(dictionary), "kvtc": Path(kvtc)}
         self._codecs: dict[str, object] = {}
 
     def codec(self, kind: str):
         """Load a codec on first use and check it was fit for this model."""
         if kind not in self._codecs:
             path = self._paths[kind]
-            codec = PCACodec(path, self.device) if kind == "pca" else LexicoCodec(path, self.device)
+            if kind == "kvtc":
+                if self._model is None:
+                    raise ValueError("kvtc methods need Methods(..., model=model) for RoPE tables.")
+                codec = KVTCCodec(path, self.device, self._model)
+            else:
+                codec = PCACodec(path, self.device) if kind == "pca" else LexicoCodec(path, self.device)
             if codec.model != self.model_id:
                 raise RuntimeError(f"{path} was fit for {codec.model}; refit for {self.model_id}.")
             self._codecs[kind] = codec
@@ -151,6 +163,12 @@ class Methods:
             ))
             return Compressed(allocation.keys, allocation.values, allocation.evicted,
                               allocation.used_bytes, seconds, allocation.histogram)
+        if name.startswith(("kvtc@", "dkvtc@")):
+            per_token = name.startswith("dkvtc@")
+            (new_keys, new_values, used, histogram), seconds = self._timed(lambda: self.codec("kvtc").compress(
+                keys, values, float(name.split("@")[1]), self.recent, per_token
+            ))
+            return Compressed(new_keys, new_values, None, used, seconds, histogram)
         if name.startswith("lex@"):
             atoms = self._atoms_for_budget(float(name[4:]), keys[0].shape[-2], keys[0].shape[-1])
             specs = [("lex", atoms), ("lex", atoms)]

@@ -43,6 +43,7 @@ def main() -> None:
     parser.add_argument("--seeds", type=int, default=9, help="Needle contexts; 6 questions each.")
     parser.add_argument("--ppl-chunks", type=int, default=8)
     parser.add_argument("--ppl-eval-tokens", type=int, default=512)
+    parser.add_argument("--kvtc", default="checkpoints/kvtc.pt", help="fit_kvtc.py output.")
     parser.add_argument("--recent", type=int, default=32)
     parser.add_argument("--output", type=Path, default=Path("results/grid.csv"))
     args = parser.parse_args()
@@ -50,7 +51,8 @@ def main() -> None:
     names = [template.format(b=f"{budget:.2f}") for budget in args.budgets for template in args.templates]
     tokenizer, model, device = load_model(args.model)
     dimmer.install(model)
-    methods = Methods(args.model, args.basis, args.dictionary, device, args.recent)
+    methods = Methods(args.model, args.basis, args.dictionary, device, args.recent,
+                      model=model, kvtc=args.kvtc)
     methods.codec("lex")  # Fail early if the dictionary does not match the model.
 
     args.output.parent.mkdir(parents=True, exist_ok=True)

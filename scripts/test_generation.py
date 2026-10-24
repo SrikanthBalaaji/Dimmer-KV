@@ -226,6 +226,7 @@ def main() -> None:
     parser.add_argument("--configs", nargs="+", default=list(DEFAULT_METHODS), help="Method names (methods.py).")
     parser.add_argument("--context-tokens", type=int, default=1500)
     parser.add_argument("--seeds", type=int, default=3, help="Contexts (different filler and numbers).")
+    parser.add_argument("--kvtc", default="checkpoints/kvtc.pt", help="fit_kvtc.py output.")
     parser.add_argument("--recent", type=int, default=32, help="Last context tokens kept exact.")
     parser.add_argument("--max-new-tokens", type=int, default=12)
     parser.add_argument("--mode", default="after", choices=("after", "prompt"))
@@ -233,7 +234,8 @@ def main() -> None:
 
     tokenizer, model, device = load_model(args.model)
     dimmer.install(model)
-    methods = Methods(args.model, args.basis, args.dictionary, device, args.recent)
+    methods = Methods(args.model, args.basis, args.dictionary, device, args.recent,
+                      model=model, kvtc=args.kvtc)
     rows = run_needles(model, tokenizer, methods, args.configs, args.mode, args.seeds, args.context_tokens,
                        args.max_new_tokens)
     print(f"mode: {args.mode}, seeds: {args.seeds}, needles: {rows[0]['n']}, "
