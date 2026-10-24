@@ -23,6 +23,7 @@ import dimmer
 import kvtc_storage
 from bench_codecs import synchronize
 from common import DEFAULT_MODEL, build_cache, kv_config, load_model, wikitext_token_chunks
+from compressed_attention import CompressedContext, greedy_answer
 from methods import Methods
 from test_generation import build_prompt, split_ids, split_ids_in_prompt
 
@@ -97,7 +98,7 @@ def answer_with(keys, values, evicted, context_ids, tail_ids) -> str:
     return tokenizer.decode(generated[0, input_ids.shape[1]:], skip_special_tokens=True).strip()
 
 
-def run_method(label: str, budget: float, head_ids, tail_ids, keys, values, scores):
+def run_method(label: str, budget: float, head_ids, tail_ids, keys, values, scores, direct: bool = False):
     name = METHODS[label].format(b=f"{budget:g}")
     tokens = head_ids.shape[0]
     full_bytes = tokens * config.fp16_bytes_per_token()
@@ -116,11 +117,27 @@ def run_method(label: str, budget: float, head_ids, tail_ids, keys, values, scor
         refine_ms = None
         if compressed.refine is not None:
             (q_keys, q_values, fetched), refine_ms = timed(lambda: compressed.refine(tail_ids, tokens))
-        reply = answer_with(q_keys, q_values, compressed.evicted, head_ids, tail_ids)
+        gpu_held, path = full_bytes, "rebuilt FP16 cache"
+        if direct and name.startswith(("kvtcf@", "kvtc@", "dkvtc@")):
+            # Answer over the codes: keys rebuilt per layer, values never decoded.
+            codec = methods.codec("kvtc")
+            context = CompressedContext(codec, keys, values, model)
+            exact = build_cache([l.keys.clone() for l in context.exact_cache.layers],
+                                [l.values.clone() for l in context.exact_cache.layers], model)
+            (reply, _), answer_ms = timed(lambda: greedy_answer(model, tokenizer, context, exact,
+                                                                tail_ids[None].to(device), tokens, 16))
+            gpu_held, path = context.code_bytes() + context.exact_bytes(), "directly over the codes"
+        else:
+            reply, answer_ms = timed(lambda: answer_with(q_keys, q_values, compressed.evicted, head_ids, tail_ids))
+            if name.startswith("h2o:"):
+                # A real eviction cache holds only the kept tokens (here they are masked in a full cache).
+                gpu_held, path = compressed.used_bytes, "kept tokens only (evicted tokens are gone)"
+            elif direct and name != "full":
+                path = "rebuilt FP16 cache (direct mode covers kvtc / DimmerKV-kvtc only)"
     return {
         "name": name, "reply": reply, "stored": stored, "full": full_bytes, "fetched": fetched,
         "compress_ms": compressed.seconds * 1000, "restore_ms": restore_ms, "refine_ms": refine_ms,
-        "token_bytes": compressed.token_bytes,
+        "token_bytes": compressed.token_bytes, "gpu_held": gpu_held, "path": path, "answer_ms": answer_ms,
     }
 
 
@@ -146,6 +163,11 @@ def card(label: str, result: dict, expected: str | None) -> str:
     if result["refine_ms"] is not None:
         lines.append(f"| Question-time refinement | fetched {result['fetched'] / 2**20:.2f} MB "
                      f"in {result['refine_ms']:.0f} ms |")
+    held = result["gpu_held"] / 2**20
+    note = "" if result["gpu_held"] >= result["full"] else f" (**{result['full'] / result['gpu_held']:.0f}× less**)"
+    lines.append(f"| GPU memory for this conversation while answering | **{held:.1f} MB**{note} · "
+                 f"{result['path']} |")
+    lines.append(f"| Answer time | {result['answer_ms']:.0f} ms |")
     return "\n".join(lines)
 
 
@@ -222,14 +244,14 @@ def document_header(head_ids, prefill_ms: float, in_prompt: bool) -> str:
 
 
 def run(sample: int, question_choice: str, custom_question: str, in_prompt: bool, budget_percent: float,
-        left: str, right: str):
+        left: str, right: str, direct: bool = False):
     context, question, expected = resolve_question(sample, question_choice, custom_question)
     head_ids, tail_ids, keys, values, scores, prefill_ms = prefill(context, question, in_prompt)
     budget = budget_percent / 100
     outputs = []
     for label in (left, right):
         try:
-            result = run_method(label, budget, head_ids, tail_ids, keys, values, scores)
+            result = run_method(label, budget, head_ids, tail_ids, keys, values, scores, direct)
             outputs.append((card(label, result, expected) + "\n\n" + token_summary(result["token_bytes"]),
                             heat_map(head_ids, result["token_bytes"], expected)))
         except (ValueError, AssertionError) as error:
@@ -239,7 +261,8 @@ def run(sample: int, question_choice: str, custom_question: str, in_prompt: bool
             outputs[0][0], outputs[1][0], outputs[0][1], outputs[1][1])
 
 
-def run_all(sample: int, question_choice: str, custom_question: str, in_prompt: bool, budget_percent: float):
+def run_all(sample: int, question_choice: str, custom_question: str, in_prompt: bool, budget_percent: float,
+            direct: bool = False):
     """Every method on the same question and budget: a leaderboard and a size chart."""
     import pandas as pd
 
@@ -251,10 +274,11 @@ def run_all(sample: int, question_choice: str, custom_question: str, in_prompt: 
     for label in METHODS:
         short = label.split(" (")[0]
         try:
-            r = run_method(label, budget, head_ids, tail_ids, keys, values, scores)
+            r = run_method(label, budget, head_ids, tail_ids, keys, values, scores, direct)
         except (ValueError, AssertionError):
             rows.append({"Method": short, "Answer": "—", "Correct": "budget too small", "Stored MB": None,
-                         "× smaller": None, per_ram: None, "Compress ms": None, "Restore / refine ms": None})
+                         "× smaller": None, per_ram: None, "GPU MB while answering": None, "Compress ms": None,
+                         "Restore / refine ms": None})
             continue
         correct = ("✅" if expected in r["reply"] else "❌") if expected else "?"
         extra = r["restore_ms"] if r["restore_ms"] is not None else r["refine_ms"]
@@ -262,6 +286,7 @@ def run_all(sample: int, question_choice: str, custom_question: str, in_prompt: 
             "Method": short, "Answer": r["reply"][:24], "Correct": correct,
             "Stored MB": round(r["stored"] / 2**20, 2), "× smaller": round(r["full"] / max(r["stored"], 1), 1),
             per_ram: int(RAM_GIB * 2**30 // max(r["stored"], 1)),
+            "GPU MB while answering": round(r["gpu_held"] / 2**20, 1),
             "Compress ms": round(r["compress_ms"]), "Restore / refine ms": None if extra is None else round(extra),
         })
     table = pd.DataFrame(rows)
@@ -316,7 +341,9 @@ HOW_IT_WORKS = """
 3. **Store**: bit-pack + DEFLATE; a hot tier with each token's first planes, a cold tier with the rest.
 4. **Restore per question**: decode only the PCA groups that carry bits and re-apply RoPE; optionally
    score the restored cache with the question and fetch the full planes for its top ~1% of tokens.
-5. **Answer**: the model attends over a normal FP16 cache (same speed), with dropped tokens masked.
+5. **Answer without rebuilding the cache**: keys are rebuilt one layer at a time and discarded, values are
+   never decoded (attention weights the coefficients, then applies the basis once per head); answers are
+   identical to the fully decoded cache, with 8–14× less GPU memory at 2%.
 
 **Why this pipeline:** eviction (H2O) deletes facts that a later question needs; per-head PCA and Lexico
 were too lossy or too slow; kvtc's cross-layer transform keeps nearly everything at 2–5%; DimmerKV's
@@ -375,6 +402,7 @@ with gr.Blocks(title="DimmerKV") as demo:
         with gr.Row():
             budget = gr.Slider(1.5, 20, value=4, step=0.5, label="Memory budget (% of the full FP16 cache)")
             in_prompt = gr.Checkbox(value=False, label="Question known before compression (in the prompt)")
+            direct = gr.Checkbox(value=True, label="Answer directly from the compressed cache (no full decode)")
         with gr.Row():
             left = gr.Dropdown(list(METHODS), value="H2O (evict by attention)", label="Method A")
             right = gr.Dropdown(list(METHODS), value="DimmerKV (per-token precision)", label="Method B")
@@ -400,13 +428,13 @@ with gr.Blocks(title="DimmerKV") as demo:
         gr.Markdown(RESULTS)
 
     sample.change(update_questions, sample, question)
-    run_inputs = [sample, question, custom, in_prompt, budget, left, right]
+    run_inputs = [sample, question, custom, in_prompt, budget, left, right, direct]
     run_outputs = [header, card_a, card_b, heat_a, heat_b]
     for button, name in zip(scenario_buttons, SCENARIOS):
         button.click(lambda name=name: apply_scenario(name), None, [in_prompt, budget, left, right]) \
             .then(run, run_inputs, run_outputs)
     go.click(run, run_inputs, run_outputs)
-    go_all.click(run_all, [sample, question, custom, in_prompt, budget], [header, board, chart]) \
+    go_all.click(run_all, [sample, question, custom, in_prompt, budget, direct], [header, board, chart]) \
         .then(lambda: gr.update(open=True), None, all_box)
 
 if __name__ == "__main__":
