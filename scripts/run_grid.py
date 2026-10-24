@@ -26,7 +26,7 @@ DEFAULT_TEMPLATES = ("lex@{b}", "h2o:{b}", "h2o:{b}:snap", "dkv:{b}:flat", "dkv:
 FIELDS = (
     "model", "task", "method", "budget", "bytes_ratio", "n", "correct", "accuracy", "agree", "answer_nll",
     "answer_p", "ppl", "context_tokens", "prefill_ms", "compress_ms", "gen_ms_per_token", "peak_gpu_mb",
-    "levels", "finished",
+    "levels", "fetched_ratio", "refine_ms", "finished",
 )
 
 
