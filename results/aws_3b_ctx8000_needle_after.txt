@@ -1,0 +1,41 @@
+=== meta-llama/Llama-3.2-3B-Instruct: needle_after (24 methods)
+          method  bytes  fetch  correct  agree  ans NLL  ans p compress ms gen ms/tok
+            full  1.000  0.000   36/36      36    0.009  0.991           0       28.0
+        h2o:0.02  0.020  0.000    0/36       0    9.617  0.000          51       27.6
+   h2o:0.02:snap  0.020  0.000    1/36       1    8.881  0.000          41       27.6
+      kvtcf@0.02  0.020  0.000   36/36      35    0.013  0.988        2021       28.0
+      dkvtc@0.02  0.020  0.000   36/36      35    0.011  0.989        1832       28.0
+ dkvtc@0.02:snap  0.020  0.000   36/36      35    0.016  0.984        1846       28.1
+       prog@0.02  0.020  0.000   36/36      35    0.015  0.986        1615       28.0
+  prog@0.02:snap  0.020  0.000   36/36      35    0.018  0.983        1609       28.0
+ prog@0.02:r0.02  0.020  0.010   36/36      36    0.007  0.993        1609       28.0
+        h2o:0.03  0.030  0.000    0/36       0    9.758  0.000          41       27.5
+   h2o:0.03:snap  0.030  0.000    1/36       1    8.544  0.000          41       27.6
+      kvtcf@0.03  0.030  0.000   36/36      35    0.009  0.991        1393       28.1
+      dkvtc@0.03  0.030  0.000   36/36      35    0.008  0.992        1843       28.0
+ dkvtc@0.03:snap  0.030  0.000   36/36      34    0.005  0.995        1852       28.1
+       prog@0.03  0.030  0.000   36/36      35    0.009  0.991        1615       28.2
+  prog@0.03:snap  0.030  0.000   36/36      34    0.005  0.995        1616       28.1
+ prog@0.03:r0.02  0.030  0.010   36/36      36    0.008  0.992        1617       28.1
+        h2o:0.05  0.050  0.000    0/36       0    9.326  0.000          41       27.6
+   h2o:0.05:snap  0.050  0.000    1/36       1    8.109  0.000          41       27.7
+      kvtcf@0.05  0.050  0.000   36/36      35    0.008  0.992        1401       28.0
+      dkvtc@0.05  0.050  0.000   36/36      35    0.008  0.992        1855       28.0
+ dkvtc@0.05:snap  0.050  0.000   36/36      36    0.006  0.994        1858       28.0
+       prog@0.05  0.050  0.000   36/36      34    0.008  0.992        1619       28.0
+  prog@0.05:snap  0.050  0.000   36/36      35    0.006  0.994        1614       27.9
+ prog@0.05:r0.02  0.050  0.009   36/36      35    0.009  0.991        1615       28.0
+Traceback (most recent call last):
+  File "/home/ubuntu/dimmerkv/scripts/run_grid.py", line 85, in <module>
+    main()
+    ~~~~^^
+  File "/home/ubuntu/dimmerkv/scripts/run_grid.py", line 77, in main
+    writer.writerow({**row, "model": args.model, "finished": time.strftime("%Y-%m-%d %H:%M:%S")})
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/csv.py", line 226, in writerow
+    return self.writer.writerow(self._dict_to_list(rowdict))
+                                ~~~~~~~~~~~~~~~~~~^^^^^^^^^
+  File "/usr/lib/python3.13/csv.py", line 221, in _dict_to_list
+    raise ValueError("dict contains fields not in fieldnames: "
+                     + ", ".join([repr(x) for x in wrong_fields]))
+ValueError: dict contains fields not in fieldnames: 'refine_ms', 'fetched_ratio'

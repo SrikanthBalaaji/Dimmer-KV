@@ -1,13 +1,14 @@
 # DimmerKV — experimental findings so far
 
-Status as of Sun 25 Oct 2026, ~3:45 AM IST. Model: Llama-3.2-1B-Instruct (FP16,
+Status as of Sun 25 Oct 2026, ~6:00 AM IST. Model: Llama-3.2-1B-Instruct (FP16,
 16 layers, 8 KV heads, head dim 64) on the LOQ laptop (RTX 5060 8 GB).
 Branch: `codec-rework`. Raw numbers and the run-by-run log are in `CLAUDE.md`;
 logs in `logs/` (not committed); grid results as CSV in `results/`.
 
-## Recap of all testing (Sat 24 Oct 3 PM → Sun 25 Oct 3:30 AM)
+## Recap of all testing (Sat 24 Oct 3 PM → Sun 25 Oct 6 AM)
 
-All runs: Llama-3.2-1B-Instruct, RTX 5060 laptop (8 GB). Main test: hidden
+Runs on Llama-3.2-1B-Instruct, RTX 5060 laptop (8 GB), unless marked
+3B (Llama-3.2-3B-Instruct on an AWS L40S). Main test: hidden
 4-digit facts ("needles") in WikiText; the cache is compressed, then each
 question is asked; plus perplexity, timing, and real storage size.
 "X%" = compressed cache size as a share of the normal FP16 cache
@@ -25,7 +26,9 @@ question is asked; plus perplexity, timing, and real storage size.
 | 8 | DimmerKV on top of kvtc (per-token precision), full grid of 9 methods × budgets × 2 modes × perplexity | DimmerKV beats kvtc at equal bytes; biggest gain with question scores |
 | 9 | Real storage (bit-packed + DEFLATE) and restore | Restored cache identical; 37× smaller at 3% on 3K tokens |
 | 10 | Serving benchmark in MB / ms / tokens/s (3K and 8K tokens) | 23–37× more conversations per GiB of RAM, ~3–5× faster first token than recomputing, same generation speed |
-| — | 16K-token serving run | Stopped (pinned-memory limit on Windows, rerun not finished) |
+| 11 | Progressive bit-plane tiers + question-time refinement (hot 2% + fetch top 1% of tokens) | Fixes most of the "question later" weak spot at 8K: ans p .50 → .71 (full .75), 17 → 19/24 |
+| 12 | 3B on AWS, 8K tokens | All kvtc-family methods 36/36 at 2% (50×); H2O/SnapKV 0–1/36; test too easy to separate variants |
+| — | 16K-token serving | Laptop run stopped (pinned-memory limit); now running on AWS with 3B |
 
 **Headline comparison** (8K-token conversations, 24 questions):
 
@@ -49,8 +52,9 @@ question is asked; plus perplexity, timing, and real storage size.
 - Savings are in storage and transfer (RAM, disk, network); GPU memory and
   generation speed during answering are unchanged (Level 1).
 
-**Open items**: 16K-token run, bigger models (3B/8B on AWS), eviction as a
-precision rung, refine-on-demand for questions asked after compression.
+**Open items**: rest of the AWS 3B grid and 16K serving run, 8B, an
+eviction rung to test below 2%, refinement in the serving benchmark
+(fetch time from a cold tier), harder multi-hop needles.
 
 ## TL;DR
 
@@ -86,12 +90,17 @@ question is visible (`snap`). Sections 6–8.
 6. **Serving** (section 9): in a chat-assistant scenario, 8 GiB of RAM holds
    3,127 compressed 3K-token conversations vs 85 uncompressed (37×); first
    answer token in ~0.18 s vs 0.89 s to recompute; generation speed unchanged.
-7. **Long conversations** (section 10, 8K tokens): question visible →
+7. **Progressive tiers + refinement** (section 11): keep 2% hot, fetch the
+   question's top 1% of tokens at full precision (0.5% extra bytes) → the
+   "question after compression" case at 8K goes from ans p .50 to .71
+   (full .75). On 3B, every kvtc-family method keeps 36/36 needles at 2%
+   (50×) on 8K tokens; H2O 0/36.
+8. **Long conversations** (section 10, 8K tokens): question visible →
    DimmerKV with question scores at 3% matches the full cache (22/24 vs
    21/24) where kvtc gets 21/24 at lower confidence and SnapKV 13/24; question
    not visible → DimmerKV ties kvtc, 23× more conversations per GiB at 5%
    with full-cache accuracy; H2O 0/24.
-8. Codec history: per-head PCA < Lexico < kvtc-style cross-layer PCA. Keys are
+9. Codec history: per-head PCA < Lexico < kvtc-style cross-layer PCA. Keys are
    the fragile stream (section 2).
 
 ## How we test
@@ -613,6 +622,78 @@ What it shows:
   after the accuracy pass; a rerun with a pageable-RAM fallback was stopped
   before finishing, so there are no 16K results.
 
+## 11. Progressive tiers with question-time refinement, and 3B on AWS
+
+Design (`scripts/progressive.py`, `fit_progressive.py`):
+
+```
+encode once (kvtc: RoPE removed -> cross-layer PCA -> 8-bit codes per group of 64)
+document --prefill--> per-token DimmerKV prefix length --> bit-planes, ordered by error per byte
+   hot tier (2-3% of FP16): each token's first planes      (DimmerKV picks how many)
+   cold tier: the remaining planes of every token          (up to 8 bits everywhere)
+question arrives -> score the hot cache with the question -> fetch cold planes for the
+                    top tokens only -> rebuild those tokens -> answer
+memory pressure  -> demote a conversation by dropping planes (no re-encode)
+```
+
+- Codes are nested: the top m bits of an 8-bit code are a valid m-bit code
+  (decoded at the bin centre), so precision is cut by truncating planes.
+- The (group, plane) order is learned once on calibration data by error
+  removed per byte, scoring a group by its best run of upcoming planes (a
+  dominant key component otherwise had its first plane postponed).
+- **The progressive code is more accurate than kvtc's 0/2/4/8-bit ladder at
+  every size** (1B, calibration sample): keys 0.071 vs 0.080 rel. error at
+  1/50 of FP16, values 0.071 vs 0.085 at 1/16; finer 1-bit steps help.
+- Methods: `prog@b` (hot tier only, DimmerKV flat), `prog@b:snap`,
+  `prog@b:r<frac>` (refine the top `frac` of tokens at question time).
+- Encode ~0.6 s + hot rebuild ~0.34 s for an 8K-token context on the laptop
+  after an optimization (per-group error lookup, int32 decode); comparable
+  to kvtc.
+
+**1B, 8K tokens, question asked after compression** (24 questions; full
+cache 21/24, ans p .749; `logs/prog_8k_after.log`):
+
+| method | hot tier | fetched per question | correct | ans p |
+|---|---|---|---|---|
+| H2O | 2% | — | 0/24 | .001 |
+| kvtc filled | 2% | — | 17/24 | .511 |
+| DimmerKV-kvtc | 2% | — | 17/24 | .492 |
+| progressive, hot only | 2% | — | 18/24 | .499 |
+| **progressive + refine top 1%** | 2% | **0.5% of FP16** | **19/24** | **.705** |
+| progressive + refine top 2% | 2% | 1.0% | 19/24 | .674 |
+| progressive + refine top 5% | 2% | 2.6% | 19/24 | .645 |
+| kvtc filled | 3% | — | 20/24 | .578 |
+| progressive + refine top 2% | 3% | 1.0% | 19/24 | .685 |
+
+- **Refinement fixes most of the "question after compression" weak spot**:
+  fetching the top 1% of tokens (0.5% extra bytes) lifts answer
+  probability from ~.50 to .705 (full cache .749), above kvtc at 3%.
+  Correct answers rise from 17 to 19/24 (full 21/24).
+- Refining more tokens did not help further (.705 → .674 → .645); likely
+  noise at 24 questions, possibly the top 1% already holds what matters.
+- On 3K tokens (6 questions): hot 3% .913, + refine 2% .954, full .966.
+
+**Llama-3.2-3B on AWS (L40S), 8K tokens, question after compression**
+(36 questions; first task of the AWS grid; `results/aws_3b_ctx8000_needle_after.txt`).
+kvtc calibration for 3B (28,672 features per token) took 5.1 min.
+
+| method | 2% | 3% | 5% |
+|---|---|---|---|
+| full cache | 36/36 (.991) | | |
+| H2O | 0/36 (.000) | 0/36 (.000) | 0/36 (.000) |
+| SnapKV | 1/36 (.000) | 1/36 (.000) | 1/36 (.000) |
+| kvtc filled | 36/36 (.988) | 36/36 (.991) | 36/36 (.992) |
+| DimmerKV-kvtc | 36/36 (.989) | 36/36 (.992) | 36/36 (.992) |
+| progressive, hot only | 36/36 (.986) | 36/36 (.991) | 36/36 (.992) |
+| progressive + refine 2% | 36/36 (.993) | 36/36 (.992) | 36/36 (.991) |
+
+- **The 3B model is far more robust**: every kvtc-family method keeps
+  36/36 at 2% of FP16 (50× smaller) on 8K tokens; eviction answers 0–1/36.
+- This test is too easy for 3B to separate the variants (all ≥ .983); it
+  needs budgets below 2%, which needs a zero-byte (eviction) rung, or
+  harder tasks. The rest of the AWS grid (question in the prompt,
+  perplexity) and a 16K-token serving run are still running.
+
 ## Caveats
 
 - One small model (Llama-3.2-1B), 1.6K–3K-token contexts, synthetic needles
@@ -638,9 +719,9 @@ What it shows:
 2. **Eviction as a rung**: a zero-byte option in the ladder so DimmerKV can
    drop clearly useless tokens at extreme budgets (kvtc lists eviction as
    future work).
-3. **Refine on demand** for questions after compression: score compressed
-   tokens against the question and restore exact copies of the top few from
-   CPU storage. Question-window scores are a strong signal (section 7).
+3. ~~Refine on demand~~ built as progressive tiers (section 11). Next:
+   time the cold-tier fetch in the serving benchmark, and test refinement
+   on harder tasks and on 3B/8B.
 4. **Harder tests**: multi-hop needles (variable tracking), longer contexts,
    LongBench subset with the question in the prompt.
 5. **Demo and pitch**: "kvtc compresses every token alike; DimmerKV decides
@@ -662,6 +743,8 @@ $py = "$env:USERPROFILE\.venvs\hashcode\Scripts\python.exe"
 & $py scripts\run_grid.py --model meta-llama/Llama-3.2-1B-Instruct --dictionary checkpoints\lexico_dict.pt `
       --budgets 0.03 0.05 --templates "h2o:{b}" "kvtcf@{b}" "dkvtc@{b}" "dkvtc@{b}:snap" --context-tokens 3000
 & $py scripts\bench_memory.py                    # memory / time / accuracy table
+& $py scripts\fit_progressive.py                 # checkpoints\progressive.pt (after fit_kvtc.py)
+& $py scripts\test_generation.py --context-tokens 8000 --configs kvtcf@0.02 prog@0.02 prog@0.02:r0.01
 # Diagnostics
 & $py scripts\bench_codecs.py                    # PCA vs Lexico error, bytes, time
 & $py scripts\diagnose_scores.py                 # needle rank under H2O scores

@@ -671,3 +671,84 @@ What it shows:
 - 16K-token run: first attempt ran out of pinned host memory (Windows limit)
   after the accuracy pass; rerunning with pageable RAM fallback.
 
+
+## Progress log (2026-10-25, ~6:00 AM IST): progressive tiers, AWS 3B
+
+Design (`scripts/progressive.py`, `fit_progressive.py`):
+
+```
+encode once (kvtc: RoPE removed -> cross-layer PCA -> 8-bit codes per group of 64)
+document --prefill--> per-token DimmerKV prefix length --> bit-planes, ordered by error per byte
+   hot tier (2-3% of FP16): each token's first planes      (DimmerKV picks how many)
+   cold tier: the remaining planes of every token          (up to 8 bits everywhere)
+question arrives -> score the hot cache with the question -> fetch cold planes for the
+                    top tokens only -> rebuild those tokens -> answer
+memory pressure  -> demote a conversation by dropping planes (no re-encode)
+```
+
+- Codes are nested: the top m bits of an 8-bit code are a valid m-bit code
+  (decoded at the bin centre), so precision is cut by truncating planes.
+- The (group, plane) order is learned once on calibration data by error
+  removed per byte, scoring a group by its best run of upcoming planes (a
+  dominant key component otherwise had its first plane postponed).
+- **The progressive code is more accurate than kvtc's 0/2/4/8-bit ladder at
+  every size** (1B, calibration sample): keys 0.071 vs 0.080 rel. error at
+  1/50 of FP16, values 0.071 vs 0.085 at 1/16; finer 1-bit steps help.
+- Methods: `prog@b` (hot tier only, DimmerKV flat), `prog@b:snap`,
+  `prog@b:r<frac>` (refine the top `frac` of tokens at question time).
+- Encode ~0.6 s + hot rebuild ~0.34 s for an 8K-token context on the laptop
+  after an optimization (per-group error lookup, int32 decode); comparable
+  to kvtc.
+
+**1B, 8K tokens, question asked after compression** (24 questions; full
+cache 21/24, ans p .749; `logs/prog_8k_after.log`):
+
+| method | hot tier | fetched per question | correct | ans p |
+|---|---|---|---|---|
+| H2O | 2% | — | 0/24 | .001 |
+| kvtc filled | 2% | — | 17/24 | .511 |
+| DimmerKV-kvtc | 2% | — | 17/24 | .492 |
+| progressive, hot only | 2% | — | 18/24 | .499 |
+| **progressive + refine top 1%** | 2% | **0.5% of FP16** | **19/24** | **.705** |
+| progressive + refine top 2% | 2% | 1.0% | 19/24 | .674 |
+| progressive + refine top 5% | 2% | 2.6% | 19/24 | .645 |
+| kvtc filled | 3% | — | 20/24 | .578 |
+| progressive + refine top 2% | 3% | 1.0% | 19/24 | .685 |
+
+- **Refinement fixes most of the "question after compression" weak spot**:
+  fetching the top 1% of tokens (0.5% extra bytes) lifts answer
+  probability from ~.50 to .705 (full cache .749), above kvtc at 3%.
+  Correct answers rise from 17 to 19/24 (full 21/24).
+- Refining more tokens did not help further (.705 → .674 → .645); likely
+  noise at 24 questions, possibly the top 1% already holds what matters.
+- On 3K tokens (6 questions): hot 3% .913, + refine 2% .954, full .966.
+
+**Llama-3.2-3B on AWS (L40S), 8K tokens, question after compression**
+(36 questions; first task of the AWS grid; `results/aws_3b_ctx8000_needle_after.txt`).
+kvtc calibration for 3B (28,672 features per token) took 5.1 min.
+
+| method | 2% | 3% | 5% |
+|---|---|---|---|
+| full cache | 36/36 (.991) | | |
+| H2O | 0/36 (.000) | 0/36 (.000) | 0/36 (.000) |
+| SnapKV | 1/36 (.000) | 1/36 (.000) | 1/36 (.000) |
+| kvtc filled | 36/36 (.988) | 36/36 (.991) | 36/36 (.992) |
+| DimmerKV-kvtc | 36/36 (.989) | 36/36 (.992) | 36/36 (.992) |
+| progressive, hot only | 36/36 (.986) | 36/36 (.991) | 36/36 (.992) |
+| progressive + refine 2% | 36/36 (.993) | 36/36 (.992) | 36/36 (.991) |
+
+- **The 3B model is far more robust**: every kvtc-family method keeps
+  36/36 at 2% of FP16 (50× smaller) on 8K tokens; eviction answers 0–1/36.
+- This test is too easy for 3B to separate the variants (all ≥ .983); it
+  needs budgets below 2%, which needs a zero-byte (eviction) rung, or
+  harder tasks. The rest of the AWS grid (question in the prompt,
+  perplexity) and a 16K-token serving run are still running.
+
+
+AWS setup: `ubuntu@34.203.234.146` (g6e.2xlarge, L40S 46 GB), key
+`~/.ssh/hashcode-key.pem`. Our code in `~/dimmerkv` (copied with
+`git archive`), env `~/dimmerkv-env` (system PyTorch 2.14 + transformers
+5.20.2, datasets 5.1.0). Pipeline `~/dimmerkv/run_3b.sh` under nohup:
+fit_kvtc → fit_progressive → run_grid (8K, both modes + ppl) →
+bench_serving 16K; logs in `~/dimmerkv/logs`, results in
+`~/dimmerkv/results`. Leave the team's `~/lexico` and `~/lexico-env` alone.
