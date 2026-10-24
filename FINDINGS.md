@@ -1,6 +1,6 @@
 # DimmerKV — experimental findings so far
 
-Status as of Sat 24 Oct 2026, ~9 PM IST. Model: Llama-3.2-1B-Instruct (FP16,
+Status as of Sat 24 Oct 2026, ~10:30 PM IST. Model: Llama-3.2-1B-Instruct (FP16,
 16 layers, 8 KV heads, head dim 64) on the LOQ laptop (RTX 5060 8 GB).
 Branch: `codec-rework`. Raw numbers and the run-by-run log are in `CLAUDE.md`;
 logs in `logs/` (not committed).
@@ -241,6 +241,53 @@ have no question to see in the "after" mode.)
 
 Every number matches the old-OMP runs within one question. At 20% with the
 question in the prompt, flat and snap both reach 17/18.
+
+## 6. kvtc transform coding, and DimmerKV per-token rungs on top
+
+Implemented the kvtc idea (Staniszewski & Łańcucki, ICLR 2026; on our
+capstone list): per token, keys with RoPE removed from all 16 layers × 8 KV
+heads form one 8,192-number vector (likewise values); one PCA basis fitted
+on ~100K WikiText tokens; coefficients quantized in groups of 64 with
+0/2/4/8 bits and a per-token FP16 shift and scale per group; a greedy
+"ladder" of bit allocations from 1/64 to 1/2 of FP16 size. No DEFLATE yet.
+First 4 tokens (sinks) and last 32 exact. (`scripts/kvtc.py`, `fit_kvtc.py`;
+calibration takes 1.3 min on the laptop.)
+
+- `kvtc@b`: every token on the finest rung that fits (kvtc as published).
+- `dkvtc@b`: **DimmerKV flat on kvtc**: each token's key and value get their
+  own rung, chosen greedily by error drop per byte under the same budget.
+
+18 needles, ~1.6K-token contexts (logs/kvtc_*.log). Correct / ans p:
+
+| budget | method | bytes | after compression | question in prompt | ppl (full 15.84) | compress ms |
+|---|---|---|---|---|---|---|
+| 4% (25×) | kvtc | 0.038 | 16 / 0.753 | 16 / 0.775 | 16.24 | ~170 |
+| | dkvtc | 0.040 | **18 / 0.775** | **17 / 0.814** | **16.14** | ~250 |
+| 5% | kvtc | 0.043 | 17 / 0.767 | 16 / 0.776 | 16.09 | ~130 |
+| | dkvtc | 0.050 | 16 / 0.874 | 16 / 0.880 | 16.02 | ~190 |
+| 7% | kvtc | 0.063 | 17 / 0.916 | 17 / 0.908 | 15.95 | ~120 |
+| | dkvtc | 0.070 | 17 / 0.958 | **18 / 0.967** | 15.93 | ~185 |
+| | SnapKV eviction | 0.070 | — | 8 / 0.315 | 17.34 (H2O) | ~25 |
+| 10% | kvtc | 0.084 | 17 / 0.940 | 18 / 0.941 | 15.96 | ~120 |
+| | dkvtc | 0.100 | 17 / 0.950 | 18 / 0.966 | 15.92 | ~190 |
+| | H2O / SnapKV eviction | 0.100 | 0 / 0.002 | 12 / 0.381 | 16.99 | ~30 |
+| | DimmerKV flat on Lexico | 0.100 | 1 / 0.010 | 13 / 0.482 (snap) | 17.68 | ~1,350 |
+
+What this shows:
+
+- **kvtc is a different league from everything else we built.** At 4% memory
+  (25×) it still answers 16/18 needles with perplexity +2.6%; H2O at 10%
+  answers 0/18. Cross-layer PCA with RoPE removed is the key, as the paper's
+  ablation says. It is also ~10× faster to compress than our Lexico allocator.
+- **Per-token rungs (DimmerKV) add a consistent but modest gain on top.**
+  Uniform kvtc cannot use the whole budget (its rungs are coarse), so compare
+  along the bytes axis: at equal bytes, dkvtc's answer probability is higher
+  at every point (e.g. dkvtc 0.070 bytes → 0.958 vs kvtc 0.084 bytes → 0.940,
+  question after compression), i.e. roughly 15–25% fewer bytes for the same
+  needle quality. On perplexity the two are within noise except at 4%.
+- Correct counts are saturated (16–18/18) at these budgets; ans p and
+  perplexity carry the comparison. Budgets below ~4% are dominated by the 36
+  exact tokens in 1.6K contexts, so the tighter regime needs 4K+ contexts.
 
 ## Caveats
 
