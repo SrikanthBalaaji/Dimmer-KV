@@ -1,11 +1,11 @@
 # DimmerKV — experimental findings so far
 
-Status as of Sun 25 Oct 2026, ~7:45 AM IST. Model: Llama-3.2-1B-Instruct (FP16,
+Status as of Sun 25 Oct 2026, ~0:40 AM IST. Model: Llama-3.2-1B-Instruct (FP16,
 16 layers, 8 KV heads, head dim 64) on the LOQ laptop (RTX 5060 8 GB).
 Branch: `codec-rework`. Raw numbers and the run-by-run log are in `CLAUDE.md`;
 logs in `logs/` (not committed); grid results as CSV in `results/`.
 
-## Recap of all testing (Sat 24 Oct 3 PM → Sun 25 Oct 7:45 AM)
+## Recap of all testing (Sat 24 Oct 3 PM → Sun 25 Oct 0:40 AM)
 
 Runs on Llama-3.2-1B-Instruct, RTX 5060 laptop (8 GB), unless marked
 3B (Llama-3.2-3B-Instruct on an AWS L40S). Main test: hidden

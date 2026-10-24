@@ -172,7 +172,7 @@ $py = "$env:USERPROFILE\.venvs\hashcode\Scripts\python.exe"
 The 4:39 PM results above are superseded by the update below (old basis:
 8 prompts, BOS included, 16 components only).
 
-## Progress log (2026-10-24, ~5:20 PM IST): codec rework + first behavioral test
+## Progress log (2026-10-24, ~5:00 PM IST): codec rework + first behavioral test
 
 ### Changes
 - `scripts/common.py`: shared `choose_device`, `load_model` (uses `dtype=`),
@@ -236,7 +236,7 @@ $py = "$env:USERPROFILE\.venvs\hashcode\Scripts\python.exe"
 3. Greedy allocator over PCA/Lexico prefixes with byte budget assert; exit test
    = pass-key correct at 20%.
 
-## Progress log (2026-10-24, ~5:45 PM IST): Lexico codec + timing
+## Progress log (2026-10-24, ~5:35 PM IST): Lexico codec + timing
 
 Working rule from the team: the phase plan is a guide, adapt as results
 demand, and **every benchmark reports time** next to error and bytes.
@@ -267,7 +267,7 @@ but encode is ~40-60x slower than PCA; decode cost is the same.
 Per-question generate times are not comparable yet (first call includes
 warm-up; wrong answers stop early).
 
-## Progress log (2026-10-24, ~6:15 PM IST): K/V codec mix + better needle metrics
+## Progress log (2026-10-24, ~5:45 PM IST): K/V codec mix + better needle metrics
 
 `test_generation.py` now takes `--configs` specs (`pca16`, `lex8`,
 `pca16/lex8` = key/value) and `--seeds` (default 3 contexts x 6 needles = 18).
@@ -304,7 +304,7 @@ values also hurt. Generate time per token is identical across configs because
 Level 1 rebuilds a full FP16 cache; codes only change memory, not decode
 speed. Encode speed is the cost to attack (OMP), not the codec choice.
 
-## Progress log (2026-10-24, ~7:00 PM IST): allocator + H2O baseline
+## Progress log (2026-10-24, ~6:35 PM IST): allocator + H2O baseline
 
 - `scripts/dimmer.py`: custom attention `dimmer` (registered with
   transformers' AttentionInterface; eager math) that records H2O scores at
@@ -346,7 +346,7 @@ Lexico at 22%; at 20% it beats uniform at 22% by 5 needles. floor1 changes
 nothing (flat never evicts). 10% is a cliff for every method.
 Cost: compress ~2.4 s per 1.6K-token context (OMP to 16 atoms on every slot).
 
-## Progress log (2026-10-24, ~7:45 PM IST): H2O without eviction; question in prompt
+## Progress log (2026-10-24, ~7:15 PM IST): H2O without eviction; question in prompt
 
 - H2O-scored allocation with no eviction (floor1/2/3) still 0-1/18 in
   `after` mode; the more weight H2O gets (pow 1 -> 0.3 -> 0.1 -> flat), the
@@ -383,7 +383,7 @@ matters: summed attention misleads, question attention is excellent, no
 question -> use flat. Natural design: flat by default, re-allocate /
 refine with question-window scores when a question arrives.
 
-## Progress log (2026-10-24, ~8:30 PM IST): faster OMP
+## Progress log (2026-10-24, ~7:35 PM IST): faster OMP
 
 - `lexico.omp` now keeps an orthonormal basis of the chosen atoms
   (Gram-Schmidt, applied twice) so each step is a projection, not a linear
@@ -407,7 +407,7 @@ help. At 3K tokens: prefill 1.0 s, allocate 2.6 s (OMP 2.1 s, rest 0.45 s).
 4K prefill measured 7.5 s on the 8 GB card (eager attention memory pressure),
 not a reliable number. Allocation is still ~1.4-2.5x prefill time.
 
-## Progress log (2026-10-24, ~9:00 PM IST): full suite with the new OMP
+## Progress log (2026-10-24, ~7:50 PM IST): full suite with the new OMP
 
 `scripts/compare_omp.py` (32 layer/streams x 8,176 held-out vectors):
 97.7% of atom slots identical to `omp_reference`; stored-code error
@@ -438,7 +438,7 @@ New: at 20% with the question in the prompt, flat and snap both reach 17/18
 (SnapKV eviction 13/18). Compression is ~1.3 s per 1.6K context for every
 allocator config (was ~2.4 s).
 
-## Progress log (2026-10-24, ~10:30 PM IST): kvtc + DimmerKV per-token rungs
+## Progress log (2026-10-24, ~8:50 PM IST): kvtc + DimmerKV per-token rungs
 
 Implemented the kvtc idea (Staniszewski & Łańcucki, ICLR 2026; on our
 capstone list): per token, keys with RoPE removed from all 16 layers × 8 KV
@@ -487,7 +487,7 @@ What this shows:
 
 Also added (committed earlier): `methods.py` (shared method names), `eval_perplexity.py`, `run_grid.py` (CSV grid runner). Perplexity on Lexico-era methods, 4 chunks: full 15.84; 10%: lex 18.82, H2O 16.99, SnapKV 17.14, dkv flat 17.68, dkv snap 17.27; 15%: H2O 16.71, dkv flat 16.53; 20%: dkv flat 16.05 (logs/ppl_1b.log).
 
-## Progress log (2026-10-25, ~0:30 AM IST): full comparison grid
+## Progress log (2026-10-24, ~9:55 PM IST): full comparison grid
 
 New for this grid: `kvtcf@b` (kvtc with evenly spaced tokens moved one rung
 up so it spends the whole budget; the fair equal-bytes baseline, since plain
@@ -558,7 +558,7 @@ What the grid shows:
 - Fixed during this run: `run_grid.py` printed budgets with 2 decimals, which
   merged 0.035 and 0.04; now `%g`, and the affected rows were rerun.
 
-## Progress log (2026-10-25, ~1:15 AM IST): real storage + memory/time/accuracy benchmark
+## Progress log (2026-10-24, ~10:10 PM IST): real storage + memory/time/accuracy benchmark
 
 - `kvtc_storage.py`: kvtc / DimmerKV-TC caches serialized to real bytes
   (rung ids, bit-packed codes, FP16 shift/scale, exact tokens), DEFLATE via
@@ -575,7 +575,7 @@ What the grid shows:
   restore ~0.15 s vs prefill 0.9-3.8 s (laptop prefill timing unstable at 3K).
   H2O/SnapKV/Lexico at 10-20x: 0-1/24. FINDINGS.md section 8 updated.
 
-## Progress log (2026-10-25, ~2:15 AM IST): serving benchmark
+## Progress log (2026-10-24, ~10:25 PM IST): serving benchmark
 
 `scripts/bench_serving.py`. Scenario: a chat assistant keeps many
 conversations' KV caches in host RAM between turns; a follow-up question
@@ -617,7 +617,7 @@ What it shows:
   restore), higher answer probability (.78 vs .76 at 3%, .94 vs .89 at 5%).
 
 
-## Progress log (2026-10-25, ~3:30 AM IST): long conversations (8K)
+## Progress log (2026-10-24, ~11:05 PM IST): long conversations (8K)
 
 Prefill is now chunked (512 tokens at a time; scores summed across chunks,
 checked against one-pass prefill: identical up to FP16 rounding), so 8K
@@ -672,7 +672,7 @@ What it shows:
   after the accuracy pass; rerunning with pageable RAM fallback.
 
 
-## Progress log (2026-10-25, ~6:00 AM IST): progressive tiers, AWS 3B
+## Progress log (2026-10-25, ~0:15 AM IST): progressive tiers, AWS 3B
 
 Design (`scripts/progressive.py`, `fit_progressive.py`):
 
@@ -753,7 +753,7 @@ fit_kvtc → fit_progressive → run_grid (8K, both modes + ppl) →
 bench_serving 16K; logs in `~/dimmerkv/logs`, results in
 `~/dimmerkv/results`. Leave the team's `~/lexico` and `~/lexico-env` alone.
 
-## Progress log (2026-10-25, ~7:45 AM IST): eviction level, faster restore, 3B 16K
+## Progress log (2026-10-25, ~0:30 AM IST): eviction level, faster restore, 3B 16K
 
 **Partial-basis decode.** Rebuilding the cache multiplied every token by the
 full features × features PCA basis, although at low budgets most groups of
