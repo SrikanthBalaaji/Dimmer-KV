@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Secrets
+.env
+kaggle.json
+access_token
+kaggle.txt
+.kaggle/
+*.pem
+
+# Models, caches, large outputs
+hf_cache/
+*.safetensors
+*.bin
+*.pt
+checkpoints/
+wandb/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.ipynb_checkpoints/
