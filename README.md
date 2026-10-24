@@ -130,6 +130,20 @@ rebuilt before answering.
 | DimmerKV + question scores + eviction 2% | 12/12 | 253 MB → **31 MB** | 31 → 31 |
 | kvtc 5% | 12/12 | 253 MB → 55 MB | 43 → 29 |
 
+**RULER-style tasks (1B, 20 samples per cell)**: the two long-context tasks the kvtc paper reports
+
+| method | variable tracking 8K, 3%, question in prompt | variable tracking 8K, 2%, question later | key-value retrieval 4K, 5%, question later |
+|---|---|---|---|
+| Full cache | 0.96 | 0.96 | 0.65 |
+| H2O | 0.15 | 0.02 | 0.00 |
+| SnapKV | 0.34 | 0.00 | 0.00 |
+| kvtc | 0.82 | 0.82 | **0.70** |
+| DimmerKV + question scores + eviction | **0.92** | 0.84 | 0.40 |
+| DimmerKV progressive + refine top 1% | 0.87 | **0.87** | 0.55 |
+
+DimmerKV wins where importance is uneven (multi-hop chains in filler); on a dense table of random
+UUIDs, where every token matters equally, plain kvtc's uniform precision is better.
+
 **Perplexity: 3B, 8K tokens** (full cache 8.33; lower is better)
 
 | method | 2% | 3% | 5% |
@@ -167,6 +181,7 @@ $py = "$env:USERPROFILE\.venvs\hashcode\Scripts\python.exe"
 & $py scripts\test_generation.py --mode prompt --context-tokens 8000 --configs h2o:0.02:snap dkvtc@0.02:snap:ev
 & $py scripts\eval_perplexity.py --configs kvtcf@0.03 dkvtc@0.03:snap h2o:0.03
 & $py scripts\bench_serving.py --context-tokens 8000 --methods h2o:0.02 kvtcf@0.02 dkvtc@0.02
+& $py scripts\eval_ruler.py --task vt --context-tokens 8000 --configs kvtcf@0.03 dkvtc@0.03:snap:ev h2o:0.03
 & $py scripts\test_compressed_attention.py --context-tokens 8000 --methods kvtcf@0.02 dkvtc@0.02
 & $py scripts\run_grid.py --model meta-llama/Llama-3.2-1B-Instruct --budgets 0.02 0.05 --templates "h2o:{b}" "kvtcf@{b}" "dkvtc@{b}"
 ```
@@ -197,6 +212,8 @@ the top of [`scripts/methods.py`](scripts/methods.py).
   rebuilds an FP16 cache, and prefill still builds the full cache once before compressing.
 - **Without the question, per-token precision alone is only slightly better than kvtc** (often tied at
   8K tokens); the clear gains come from question scores and question-time refinement.
+- **Per-token precision can lose to uniform kvtc** when every token matters equally: on RULER-style
+  key-value retrieval (random UUIDs) kvtc scores 0.65–0.70 at 5% vs 0.35–0.55 for DimmerKV variants.
 - **The 3B model is near the ceiling** of our needle test at 2%, so methods are hard to separate there.
   8B and harder tasks (multi-hop, LongBench) are next.
 - **Our kvtc is simplified**: greedy bit allocation instead of the paper's dynamic program, fixed groups

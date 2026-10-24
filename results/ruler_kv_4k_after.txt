@@ -1,0 +1,15 @@
+task kv (UUID pairs), mode after, 20 samples, ~3933 tokens
+              method  bytes   score compress ms
+                full  1.000   0.650           0
+            h2o:0.03  0.030   0.000          40
+       h2o:0.03:snap  0.030   0.000          36
+          kvtcf@0.03  0.030   0.050         157
+          dkvtc@0.03  0.030   0.100         315
+  dkvtc@0.03:snap:ev  0.030   0.200         460
+     prog@0.03:r0.01  0.030   0.000         308
+            h2o:0.05  0.050   0.000          37
+       h2o:0.05:snap  0.050   0.000          36
+          kvtcf@0.05  0.050   0.700         166
+          dkvtc@0.05  0.050   0.450         333
+  dkvtc@0.05:snap:ev  0.050   0.400         464
+     prog@0.05:r0.01  0.050   0.550         307

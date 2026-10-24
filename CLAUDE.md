@@ -815,3 +815,14 @@ space, exact tokens in a small cache. 1B, 8K tokens: same answers 60/60;
 GPU memory held per conversation 253 MB -> 18-31 MB at 2%; ~0.9x speed at 2%,
 0.6-0.7x at 5%. Details in FINDINGS.md section 13; test:
 `scripts/test_compressed_attention.py`.
+
+## Progress log (2026-10-25, ~3:40 AM IST): demo direct mode, RULER-style tasks
+
+- Demo: toggle "Answer directly from the compressed cache" (on by default);
+  cards and leaderboard show GPU memory held while answering; eviction methods
+  report their kept-token size.
+- `scripts/eval_ruler.py`: variable tracking (8K) and key-value retrieval (4K),
+  20 samples, both modes. Variable tracking: DimmerKV question-aware 0.92 vs
+  kvtc 0.82 (full 0.96). Key-value retrieval: kvtc 0.65-0.70 at 5% beats
+  DimmerKV 0.35-0.55 (dense, equally important tokens). Eviction collapses on
+  both. FINDINGS.md section 14; results/ruler_*.txt.
