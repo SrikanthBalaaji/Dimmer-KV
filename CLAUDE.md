@@ -570,3 +570,7 @@ What the grid shows:
   ~1.1x on top; stored size = counted + rung ids. Full run (1.5K/3K, 24
   needles) in progress -> results/memory_time_accuracy.csv. FINDINGS.md
   updated: new TL;DR (DimmerKV on kvtc), section 8, caveats, next steps.
+- Full bench_memory run done (results/memory_time_accuracy.csv): 3K ctx,
+  3%: kvtc family 37-41x after DEFLATE, 23/24 needles, ppl 11.58 vs 11.32;
+  restore ~0.15 s vs prefill 0.9-3.8 s (laptop prefill timing unstable at 3K).
+  H2O/SnapKV/Lexico at 10-20x: 0-1/24. FINDINGS.md section 8 updated.

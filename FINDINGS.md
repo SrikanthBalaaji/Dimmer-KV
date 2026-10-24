@@ -1,6 +1,6 @@
 # DimmerKV — experimental findings so far
 
-Status as of Sun 25 Oct 2026, ~1:15 AM IST. Model: Llama-3.2-1B-Instruct (FP16,
+Status as of Sun 25 Oct 2026, ~1:40 AM IST. Model: Llama-3.2-1B-Instruct (FP16,
 16 layers, 8 KV heads, head dim 64) on the LOQ laptop (RTX 5060 8 GB).
 Branch: `codec-rework`. Raw numbers and the run-by-run log are in `CLAUDE.md`;
 logs in `logs/` (not committed); grid results as CSV in `results/`.
@@ -30,10 +30,12 @@ question is visible (`snap`). Sections 6–8.
    it doubled needle accuracy at equal bytes (section 3); on kvtc it is a
    smaller but consistent gain. Summed H2O attention as the importance signal
    hurts; question-window attention helps.
-5. **Real storage and time** (section 8, preliminary): the compressed cache is
-   written to real bytes (bit-packed, DEFLATE) and restored exactly; restoring
-   takes ~80–100 ms per 1.6K-token context versus ~340 ms to recompute the
-   prefill. DEFLATE adds ~1.1× on top of quantization.
+5. **Real storage and time** (section 8): the compressed cache is written to
+   real bytes (bit-packed, DEFLATE) and restored exactly. At 3% memory on a
+   3K-token context it is 37× smaller than FP16 (100 MB → 2.7 MB) with 23/24
+   needles; restoring takes ~0.16 s versus 0.9–3.8 s to recompute the prefill
+   (~86 vs 342 ms at 1.6K tokens). Eviction and Lexico at 10–20× answer
+   0–1/24.
 6. Codec history: per-head PCA < Lexico < kvtc-style cross-layer PCA. Keys are
    the fragile stream (section 2).
 
@@ -385,37 +387,80 @@ stored and DEFLATE size; compression, DEFLATE and restore time
 prefill; and needle accuracy (question after compression) and perplexity on
 the same contexts. Output: `results/memory_time_accuracy.csv`.
 
-**Preliminary (one 1.6K-token context, 6 needles, 1 perplexity chunk;
-the full run with 1.5K and 3K contexts and 24 needles is in progress):**
+Full run: 4 contexts × 6 needles = 24 per setting (question after
+compression), 4 perplexity chunks (context + 512 scored tokens). Sizes are
+relative to the FP16 KV cache; "×" is the reduction after DEFLATE (counted
+size for methods without real storage). Times per context, CUDA-synced;
+DEFLATE runs on the CPU.
 
-| method | stored / FP16 | after DEFLATE | × smaller | compress ms | DEFLATE ms | restore ms | needles / ans p | ppl |
+**~1.6K-token contexts** (full cache: 24/24, ans p .98, ppl 16.53; FP16 KV
+≈ 50 MB per context; prefill 342 ms):
+
+| method | stored | after DEFLATE | × | compress ms | DEFLATE ms | restore ms | needles / ans p | ppl |
 |---|---|---|---|---|---|---|---|---|
-| full FP16 | 1.000 | 0.907 | 1.1 | — | 1,292 | 240 | 6/6 / .97 | 16.46 |
-| H2O 5% | 0.050 (counted) | — | 20 | 20 | — | — | 0/6 / .00 | 17.34 |
-| H2O 10% | 0.100 (counted) | — | 10 | 21 | — | — | 0/6 / .00 | 17.33 |
-| Lexico 10% | 0.082 (counted) | — | 12 | 553 | — | — | 0/6 / .00 | 18.14 |
-| DimmerKV-Lexico flat 10% | 0.100 (counted) | — | 10 | 1,482 | — | — | 0/6 / .01 | 16.95 |
-| kvtc 5% | 0.043 | 0.039 | 25.7 | 137 | 60 | 82 | 6/6 / .82 | 16.61 |
-| kvtc filled 5% | 0.050 | 0.045 | 22.0 | 119 | 67 | 79 | 6/6 / .82 | 16.49 |
-| **DimmerKV-kvtc 5%** | 0.050 | 0.046 | 21.9 | 186 | 65 | 84 | 6/6 / **.88** | 16.50 |
-| kvtc 10% | 0.084 | 0.075 | 13.3 | 115 | 115 | 86 | 6/6 / .94 | 16.49 |
-| kvtc filled 10% | 0.100 | 0.090 | 11.1 | 120 | 138 | 91 | 5/6 / .89 | 16.51 |
-| **DimmerKV-kvtc 10%** | 0.100 | 0.090 | 11.1 | 177 | 136 | 103 | 6/6 / **.95** | **16.47** |
+| full FP16 + DEFLATE | 1.000 | 0.909 | 1.1 | — | 1,416 | 236 | 24 / .98 | 16.53 |
+| Lexico 10% | 0.082 (counted) | — | 12.2 | 225 | — | — | 0 / .00 | 19.31 |
+| DimmerKV-Lexico flat 10% | 0.100 (counted) | — | 10 | 1,334 | — | — | 1 / .01 | 18.15 |
+| H2O 5% | 0.050 (counted) | — | 20 | 21 | — | — | 0 / .00 | 18.36 |
+| H2O 10% | 0.100 (counted) | — | 10 | 21 | — | — | 0 / .00 | 17.66 |
+| SnapKV 10% | 0.100 (counted) | — | 10 | 21 | — | — | 0 / .00 | 17.86 |
+| kvtc 5% | 0.043 | 0.039 | 25.6 | 120 | 62 | 78 | 23 / .78 | 16.64 |
+| kvtc filled 5% | 0.050 | 0.045 | 22.0 | 119 | 73 | 80 | 24 / .84 | 16.59 |
+| **DimmerKV-kvtc 5%** | 0.050 | 0.046 | 21.9 | 183 | 71 | 86 | 21 / **.87** | 16.61 |
+| kvtc 10% | 0.084 | 0.075 | 13.3 | 117 | 126 | 92 | 23 / .94 | 16.55 |
+| kvtc filled 10% | 0.100 | 0.090 | 11.1 | 116 | 149 | 100 | 22 / .93 | 16.57 |
+| **DimmerKV-kvtc 10%** | 0.100 | 0.090 | 11.1 | 176 | 148 | 100 | 23 / **.95** | 16.58 |
 
-Re-running prefill for this context takes ~340 ms; restoring the compressed
-cache takes ~80–100 ms (~3.5–4× faster time to first token), from storage
-11–26× smaller than FP16.
+**~3.1K-token contexts** (full cache: 24/24, ans p .95, ppl 11.32; FP16 KV
+≈ 100 MB per context; prefill 0.9–3.8 s on the laptop, see note):
+
+| method | stored | after DEFLATE | × | compress ms | DEFLATE ms | restore ms | needles / ans p | ppl |
+|---|---|---|---|---|---|---|---|---|
+| full FP16 + DEFLATE | 1.000 | 0.908 | 1.1 | — | 3,079 | 523 | 24 / .95 | 11.32 |
+| Lexico 10% | 0.096 (counted) | — | 10.4 | 362 | — | — | 0 / .00 | 13.90 |
+| DimmerKV-Lexico flat 10% | 0.100 (counted) | — | 10 | 2,416 | — | — | 0 / .00 | 13.44 |
+| H2O 5% | 0.050 (counted) | — | 20 | 28 | — | — | 0 / .00 | 12.72 |
+| H2O 10% | 0.100 (counted) | — | 10 | 30 | — | — | 0 / .00 | 12.29 |
+| SnapKV 10% | 0.100 (counted) | — | 10 | 28 | — | — | 0 / .00 | 12.21 |
+| kvtc 3% | 0.027 | 0.024 | **41.2** | 243 | 89 | 148 | 23 / .75 | 11.62 |
+| kvtc filled 3% | 0.030 | 0.027 | 36.8 | 257 | 106 | 153 | 23 / .76 | 11.58 |
+| **DimmerKV-kvtc 3%** | 0.030 | 0.027 | 36.8 | 348 | 104 | 157 | 23 / **.78** | 11.58 |
+| kvtc 5% | 0.042 | 0.038 | 26.5 | 245 | 159 | 154 | 24 / .87 | 11.48 |
+| kvtc filled 5% | 0.050 | 0.045 | 22.4 | 244 | 185 | 165 | 24 / .89 | 11.48 |
+| **DimmerKV-kvtc 5%** | 0.050 | 0.045 | 22.3 | 360 | 181 | 171 | 24 / **.94** | **11.45** |
+| kvtc 10% | 0.094 | 0.084 | 11.9 | 249 | 318 | 185 | 24 / .90 | 11.34 |
+| kvtc filled 10% | 0.100 | 0.090 | 11.1 | 251 | 341 | 198 | 24 / .91 | 11.33 |
+| DimmerKV-kvtc 10% | 0.100 | 0.090 | 11.1 | 353 | 347 | 197 | 24 / .92 | 11.37 |
+
+Every restored kvtc-family cache matched the in-memory compressed cache
+exactly (max abs difference 0.0).
 
 Observations:
 
-- Stored size equals the counted size plus the per-token rung ids (≤0.1%), so
-  the byte accounting used in all earlier sections holds for real storage.
-- DEFLATE adds ~1.1× on top of quantization (kvtc reports ~1.23× with GPU
-  nvCOMP); on raw FP16 it gives only 1.1× in total.
-- DEFLATE runs on the CPU here (60–140 ms for the compressed cache, 1.3 s for
-  raw FP16); a GPU codec would cut this.
+- **Memory**: the kvtc family stores the cache 11–41× smaller than FP16
+  (e.g. 100 MB → 2.7 MB at 3% on a 3K context: 37× after DEFLATE) while
+  keeping 23–24/24 needles and perplexity within 2.7% of the full cache.
+  Eviction (H2O, SnapKV) and Lexico at 10–20× answer 0–1/24 needles when the
+  question comes after compression, and their perplexity is 8–23% worse.
+- **Time**: compression takes 0.12–0.36 s per context, restoring from bytes
+  0.08–0.2 s. Restoring is ~4× faster than re-running prefill at 1.6K tokens
+  (86 vs 342 ms) and 6–24× faster at 3K (157–171 ms vs 0.9–3.8 s). DimmerKV's
+  per-token allocation costs ~60–110 ms more than uniform kvtc to compress and
+  nothing extra to restore.
+- **Accuracy at equal bytes** (kvtc filled vs DimmerKV-kvtc): DimmerKV has the
+  higher answer probability in 5 of 6 settings (+.01 to +.05); needle counts
+  and perplexity are within noise of each other. The gain is consistent but
+  small without question scores (section 7 has the question-aware results).
+- **Storage format**: stored size equals the counted size plus the per-token
+  rung ids (≤0.1%), so the byte accounting used in earlier sections holds.
+  DEFLATE adds ~1.1× on top of quantization (kvtc reports ~1.23× with GPU
+  nvCOMP) and only 1.1× in total on raw FP16. DEFLATE runs on the CPU here;
+  a GPU codec would cut its 60–350 ms.
+- **Note on prefill time**: the 3K prefill measured 3.8 s in this run but
+  0.9–2.4 s in earlier runs on the same laptop (eager attention near the
+  8 GB limit), so the 3K speed-up range is wide; the 1.6K numbers are stable.
 - Peak GPU memory is unchanged (Level 1 decodes back to FP16); the savings
-  are in storage / transfer size, which is kvtc's use case.
+  are in storage and transfer size, which is kvtc's use case.
 
 ## Caveats
 
