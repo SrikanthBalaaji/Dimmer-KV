@@ -14,7 +14,8 @@ A method name is one of:
   question-window attention (summed over layers and heads); ``:ev`` adds a
   zero-byte eviction level so budgets can go below the coarsest rung;
   ``:floor`` (or ``:floor0.3``) first gives every token the rung uniform kvtc
-  could afford with half (or 30%) of the budget, then allocates the rest.
+  could afford with half (or 30%) of the budget, then allocates the rest;
+  ``:kw4`` weighs key errors 4× against value errors.
   These keep the first 4 tokens exact (kvtc's sinks) plus the recent window.
 - ``prog@<budget>``: progressive bit-plane kvtc (``progressive.py``); the
   budget is the hot tier, DimmerKV picks each token's prefix (flat).
@@ -191,7 +192,7 @@ class Methods:
         if name.startswith(("kvtc@", "kvtcf@", "dkvtc@")):
             per_token = name.startswith("dkvtc@")
             budget, *options = name.split("@")[1].split(":")
-            weights, evict, floor_share = None, False, 0.0
+            weights, evict, floor_share, key_weight = None, False, 0.0, 1.0
             for option in options:
                 if option == "snap":
                     weights = torch.stack(scores["snap"]).sum(dim=(0, 1))
@@ -199,12 +200,14 @@ class Methods:
                     evict = True
                 elif option.startswith("floor") and per_token:
                     floor_share = float(option[5:] or 0.5)
+                elif option.startswith("kw") and per_token:
+                    key_weight = float(option[2:])
                 else:
-                    raise ValueError(f"Unknown option {option!r} in {name!r} (dkvtc supports :snap, :ev, :floor).")
+                    raise ValueError(f"Unknown option {option!r} in {name!r} (dkvtc supports :snap, :ev, :floor, :kw<x>).")
             codec = self.codec("kvtc")
             (new_keys, new_values, used, histogram), seconds = self._timed(lambda: codec.compress(
                 keys, values, float(budget), self.recent, per_token, fill=name.startswith("kvtcf@"),
-                weights=weights, evict=evict, floor_share=floor_share,
+                weights=weights, evict=evict, floor_share=floor_share, key_weight=key_weight,
             ))
             return Compressed(new_keys, new_values, codec.last_evicted, used, seconds, histogram,
                               token_bytes=self._kvtc_token_bytes(codec, keys[0].shape[2]))

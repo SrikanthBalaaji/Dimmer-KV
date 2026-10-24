@@ -156,7 +156,7 @@ class KVTCCodec:
 
     def compress(self, keys, values, budget: float, exact_recent: int, per_token: bool,
                  fill: bool = False, weights: torch.Tensor | None = None, evict: bool = False,
-                 floor_share: float = 0.0):
+                 floor_share: float = 0.0, key_weight: float = 1.0):
         """kvtc (same rung for all) or DimmerKV-TC (per-token rungs) under a budget.
 
         ``fill`` (uniform only) moves an evenly spaced set of tokens one rung up
@@ -170,6 +170,8 @@ class KVTCCodec:
         ``floor_share`` (per-token only) first gives every token the finest rung
         that uniform kvtc could afford with that share of the budget, then hands
         out the rest per token; nothing is evicted below the floor.
+        ``key_weight`` (per-token only) scales key errors against value errors
+        (keys decide where attention goes, so > 1 favours key precision).
         Returns rebuilt per-layer keys and values, counted bytes and a histogram.
         """
         tokens = keys[0].shape[2]
@@ -197,6 +199,8 @@ class KVTCCodec:
                 if weights is not None:
                     importance = weights[start:end].float()
                     rung_err = rung_err * (importance / importance.mean().clamp_min(1e-12))[:, None]
+                if kind == "key":
+                    rung_err = rung_err * key_weight
                 errors.append(rung_err)
 
         level_bytes = {kind: self.streams[kind].rung_bytes + [self.exact_bytes] for kind in ("key", "value")}

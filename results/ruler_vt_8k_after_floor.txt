@@ -1,0 +1,6 @@
+task vt (hops 4), mode after, 20 samples, ~7779 tokens
+              method  bytes   score compress ms
+                full  1.000   0.960           0
+          kvtcf@0.03  0.030   0.810         293
+    dkvtc@0.03:floor  0.030   0.840         623
+dkvtc@0.03:snap:floor  0.030   0.900         899

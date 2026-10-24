@@ -1,0 +1,6 @@
+task kv (UUID pairs), mode prompt, 20 samples, ~3968 tokens
+              method  bytes   score compress ms
+                full  1.000   0.650           0
+          kvtcf@0.05  0.050   0.650         176
+   dkvtc@0.05:floor1  0.050   0.600         333
+dkvtc@0.05:snap:floor1  0.050   0.650         443
