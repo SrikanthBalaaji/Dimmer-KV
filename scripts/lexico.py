@@ -31,8 +31,57 @@ def omp(
     sparsity: int,
     ridge: float = 1e-6,
     errors: list[torch.Tensor] | None = None,
+    half_search: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sparse-code [batch, dim] vectors over unit-norm atoms [dim, atoms].
+
+    Returns atom indices [batch, sparsity] in selection order and the final
+    least-squares coefficients [batch, sparsity]. If ``errors`` is a list, the
+    squared residual norm [batch] before each step and after the last is
+    appended (sparsity + 1 entries): the exact error of every prefix length.
+
+    Keeps an orthonormal basis of the chosen atoms (Gram-Schmidt, applied
+    twice for stability), so each step is a projection instead of a linear
+    solve; coefficients are solved once at the end. On GPU the atom search
+    (the [batch, atoms] correlation) runs in FP16 when ``half_search``.
+    """
+    batch, dim = vectors.shape
+    vectors = vectors.float()
+    search = dictionary.half() if half_search and vectors.is_cuda else dictionary
+    residual = vectors.clone()
+    basis = vectors.new_zeros(batch, sparsity, dim)
+    indices = torch.empty(batch, sparsity, dtype=torch.long, device=vectors.device)
+    for step in range(sparsity):
+        if errors is not None:
+            errors.append(residual.square().sum(dim=1))
+        correlation = (residual.to(search.dtype) @ search).abs()
+        if step:
+            correlation.scatter_(1, indices[:, :step], -1.0)
+        indices[:, step] = correlation.argmax(dim=1)
+        direction = dictionary.T[indices[:, step]]
+        if step:
+            chosen = basis[:, :step]
+            for _ in range(2):
+                direction = direction - torch.einsum("bk,bkd->bd", torch.einsum("bkd,bd->bk", chosen, direction), chosen)
+        direction = direction / direction.norm(dim=1, keepdim=True).clamp_min(1e-6)
+        basis[:, step] = direction
+        residual = residual - (residual * direction).sum(dim=1, keepdim=True) * direction
+    if errors is not None:
+        errors.append(residual.square().sum(dim=1))
+    return indices, refit(vectors, indices, dictionary, ridge)
+
+
+def omp_reference(
+    vectors: torch.Tensor,
+    dictionary: torch.Tensor,
+    sparsity: int,
+    ridge: float = 1e-6,
+    errors: list[torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Original OMP: re-solves the least-squares system at every step.
+
+    Kept to check ``omp`` against. Sparse-codes [batch, dim] vectors over
+    unit-norm atoms [dim, atoms].
 
     Returns atom indices [batch, sparsity] in selection order and the final
     least-squares coefficients [batch, sparsity]. If ``errors`` is a list, the

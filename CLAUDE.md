@@ -382,3 +382,27 @@ here (question tokens are ~20 of ~1,600 queries). The score signal is what
 matters: summed attention misleads, question attention is excellent, no
 question -> use flat. Natural design: flat by default, re-allocate /
 refine with question-window scores when a question arrives.
+
+## Progress log (2026-10-24, ~8:30 PM IST): faster OMP
+
+- `lexico.omp` now keeps an orthonormal basis of the chosen atoms
+  (Gram-Schmidt, applied twice) so each step is a projection, not a linear
+  solve; coefficients are solved once at the end; the 4,096-atom search runs
+  in FP16 on GPU. The old version is kept as `omp_reference`.
+- `scripts/profile_allocator.py`: per-stage timing + check that OMP prefix
+  errors match a direct refit (max relative mismatch 1.4e-7).
+
+| | before | after |
+|---|---|---|
+| OMP 16 atoms, one layer/stream (12.4K vectors) | 70 ms | 33 ms |
+| allocate() at 15%, 1.6K-token context | 2,483 ms | 1,392 ms |
+| Lexico encode s=8, ms per 1K tokens | 581 | 347 |
+| Lexico encode s=16, ms per 1K tokens | 1,304 | 674 |
+
+Codec errors identical to 4 decimals; needle results identical (lex5 5/18,
+h2o 0/18, dkv:0.15:flat 10/18, dkv:0.20:flat 14/18; logs/needle_fast_omp.log).
+Remaining OMP time is the FP16 atom search, memory-bound at ~1.3 ms/step
+(matmul 0.4 ms + abs/argmax over [12.4K, 4096]); batching layers does not
+help. At 3K tokens: prefill 1.0 s, allocate 2.6 s (OMP 2.1 s, rest 0.45 s).
+4K prefill measured 7.5 s on the 8 GB card (eager attention memory pressure),
+not a reliable number. Allocation is still ~1.4-2.5x prefill time.
