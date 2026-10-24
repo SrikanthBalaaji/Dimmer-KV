@@ -13,6 +13,11 @@ A method name is one of:
   (``kvtc.py``); ``dkvtc@<budget>:snap`` weights each token's error by its
   question-window attention (summed over layers and heads).
   These keep the first 4 tokens exact (kvtc's sinks) plus the recent window.
+- ``prog@<budget>``: progressive bit-plane kvtc (``progressive.py``); the
+  budget is the hot tier, DimmerKV picks each token's prefix (flat).
+  Options: ``:snap`` (question-window weights), ``:r<frac>`` (at question
+  time, fetch the full stream for the top ``frac`` of tokens by the
+  question's attention over the hot cache). Example: ``prog@0.02:r0.02``.
 - ``h2o:<budget>`` (keep the highest-scoring tokens exact, evict the rest) or
   ``dkv:<budget>`` (DimmerKV allocator over Lexico prefixes), budget as a
   fraction of FP16 KV bytes, with optional ``:`` options ``floor<n>``
@@ -36,6 +41,7 @@ import lexico
 from bench_codecs import synchronize
 from kvtc import KVTCCodec
 from lexico import LexicoCodec
+from progressive import ProgressiveCodec, question_importance
 from pca_codec import PCACodec
 
 
@@ -47,6 +53,8 @@ class Compressed:
     used_bytes: int
     seconds: float
     histogram: dict[str, float] = field(default_factory=dict)
+    # Optional question-time refinement: refine(tail_ids, context_length) -> (keys, values, fetched bytes).
+    refine: object = None
 
 
 def parse_allocator(spec: str) -> dict:
@@ -98,22 +106,25 @@ class Methods:
     """Applies named compression methods to a prefilled cache."""
 
     def __init__(self, model_id: str, basis: str | Path, dictionary: str | Path, device, recent: int = 32,
-                 model=None, kvtc: str | Path = "checkpoints/kvtc.pt"):
+                 model=None, kvtc: str | Path = "checkpoints/kvtc.pt",
+                 progressive: str | Path = "checkpoints/progressive.pt"):
         self.model_id = model_id
         self.device = device
         self.recent = recent
         self._model = model
-        self._paths = {"pca": Path(basis), "lex": Path(dictionary), "kvtc": Path(kvtc)}
+        self._paths = {"pca": Path(basis), "lex": Path(dictionary), "kvtc": Path(kvtc),
+                       "prog": Path(progressive)}
         self._codecs: dict[str, object] = {}
 
     def codec(self, kind: str):
         """Load a codec on first use and check it was fit for this model."""
         if kind not in self._codecs:
             path = self._paths[kind]
-            if kind == "kvtc":
+            if kind in ("kvtc", "prog"):
                 if self._model is None:
                     raise ValueError("kvtc methods need Methods(..., model=model) for RoPE tables.")
-                codec = KVTCCodec(path, self.device, self._model)
+                codec = (KVTCCodec(path, self.device, self._model) if kind == "kvtc"
+                         else ProgressiveCodec(self._paths["kvtc"], path, self.device, self._model))
             else:
                 codec = PCACodec(path, self.device) if kind == "pca" else LexicoCodec(path, self.device)
             if codec.model != self.model_id:
@@ -166,6 +177,8 @@ class Methods:
             ))
             return Compressed(allocation.keys, allocation.values, allocation.evicted,
                               allocation.used_bytes, seconds, allocation.histogram)
+        if name.startswith("prog@"):
+            return self._progressive(name, keys, values, scores)
         if name.startswith(("kvtc@", "kvtcf@", "dkvtc@")):
             per_token = name.startswith("dkvtc@")
             budget, *options = name.split("@")[1].split(":")
@@ -191,3 +204,27 @@ class Methods:
         )
         histogram = {f"{key_size} atoms": 1.0} if name.startswith("lex@") else {}
         return Compressed(new_keys, new_values, None, key_bytes + value_bytes, key_time + value_time, histogram)
+
+    def _progressive(self, name: str, keys, values, scores) -> Compressed:
+        budget, *options = name.split("@")[1].split(":")
+        weights, fraction = None, 0.0
+        for option in options:
+            if option == "snap":
+                weights = torch.stack(scores["snap"]).sum(dim=(0, 1))
+            elif option.startswith("r"):
+                fraction = float(option[1:])
+            else:
+                raise ValueError(f"Unknown option {option!r} in {name!r}.")
+        codec = self.codec("prog")
+        stored, seconds = self._timed(lambda: codec.encode(keys, values, float(budget), self.recent, weights))
+        hot_keys, hot_values = stored.hot()
+        refine = None
+        if fraction > 0:
+            middle = stored.end - stored.start
+
+            def refine(tail_ids, context_length):
+                importance = question_importance(self._model, hot_keys, hot_values, tail_ids, context_length)
+                count = max(1, int(round(fraction * middle)))
+                top = importance[stored.start : stored.end].topk(count).indices + stored.start
+                return stored.refine(hot_keys, hot_values, top)
+        return Compressed(hot_keys, hot_values, None, stored.hot_bytes, seconds, refine=refine)

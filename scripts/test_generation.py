@@ -143,7 +143,7 @@ def run_needles(model, tokenizer, methods: Methods, names, mode="after", seeds=3
         return float(torch.nn.functional.cross_entropy(predicted, answer_ids.to(device)))
 
     stats = {name: {"correct": 0, "agree": 0, "nll": 0.0, "compress": 0.0, "gen": 0.0, "new": 0, "bytes": 0.0,
-                    "histogram": {}} for name in names}
+                    "histogram": {}, "fetched": 0.0, "refine": 0.0} for name in names}
     cases = build_cases(tokenizer, mode, seeds, context_tokens)
     total = sum(len(questions) for _, questions in cases)
     prefill_time = 0.0
@@ -173,7 +173,13 @@ def run_needles(model, tokenizer, methods: Methods, names, mode="after", seeds=3
                     entry["histogram"][level] = entry["histogram"].get(level, 0.0) + share / len(cases)
                 for index, (tail_ids, answer, answer_ids) in enumerate(questions):
                     input_ids = torch.cat([context_ids, tail_ids])[None].to(device)
-                    generated, elapsed = timed(lambda: ask(compressed.keys, compressed.values, input_ids))
+                    q_keys, q_values = compressed.keys, compressed.values
+                    if compressed.refine is not None:
+                        # Question-time refinement: fetch cold pieces for the tokens this question needs.
+                        (q_keys, q_values, fetched), elapsed = timed(lambda: compressed.refine(tail_ids, context_length))
+                        entry["fetched"] += fetched / full_bytes / total
+                        entry["refine"] += elapsed / total
+                    generated, elapsed = timed(lambda: ask(q_keys, q_values, input_ids))
                     new_tokens = generated[0, input_ids.shape[1] :]
                     reply = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
                     if name == "full":
@@ -182,8 +188,7 @@ def run_needles(model, tokenizer, methods: Methods, names, mode="after", seeds=3
                     entry["agree"] += reply == full_replies[index]
                     entry["gen"] += elapsed
                     entry["new"] += new_tokens.shape[0]
-                    entry["nll"] += answer_nll(compressed.keys, compressed.values, tail_ids, answer_ids,
-                                               context_length)
+                    entry["nll"] += answer_nll(q_keys, q_values, tail_ids, answer_ids, context_length)
             dimmer.set_eviction(None)
 
     peak = torch.cuda.max_memory_allocated() / 2**20 if device.type == "cuda" else float("nan")
@@ -201,16 +206,17 @@ def run_needles(model, tokenizer, methods: Methods, names, mode="after", seeds=3
             "gen_ms_per_token": round(entry["gen"] / max(entry["new"], 1) * 1000, 2),
             "peak_gpu_mb": round(peak),
             "levels": "; ".join(f"{k} {v:.3f}" for k, v in entry["histogram"].items() if v > 0.0005),
+            "fetched_ratio": round(entry["fetched"], 5), "refine_ms": round(entry["refine"] * 1000, 1),
         })
     return rows
 
 
 def print_rows(rows: list[dict]) -> None:
-    print(f"{'method':>16} {'bytes':>6} {'correct':>8} {'agree':>6} {'ans NLL':>8} {'ans p':>6} "
+    print(f"{'method':>16} {'bytes':>6} {'fetch':>6} {'correct':>8} {'agree':>6} {'ans NLL':>8} {'ans p':>6} "
           f"{'compress ms':>11} {'gen ms/tok':>10}")
     for row in rows:
         print(
-            f"{row['method']:>16} {row['bytes_ratio']:>6.3f} {row['correct']:>4}/{row['n']:<3} {row['agree']:>6} "
+            f"{row['method']:>16} {row['bytes_ratio']:>6.3f} {row['fetched_ratio']:>6.3f} {row['correct']:>4}/{row['n']:<3} {row['agree']:>6} "
             f"{row['answer_nll']:>8.3f} {row['answer_p']:>6.3f} {row['compress_ms']:>11.0f} "
             f"{row['gen_ms_per_token']:>10.1f}"
         )

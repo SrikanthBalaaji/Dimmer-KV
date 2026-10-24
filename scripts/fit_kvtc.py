@@ -104,9 +104,17 @@ def main() -> None:
     exact_bytes = features * 2
     for kind in ("key", "value"):
         mean = sums[kind] / count
-        covariance = (products[kind] / count - torch.outer(mean, mean)).cpu()
+        covariance = products[kind] / count - torch.outer(mean, mean)
         del products[kind]
-        eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+        # GPU eigendecomposition when it fits (large models have 28-32K features per token).
+        try:
+            eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+        except torch.OutOfMemoryError:
+            covariance = covariance.cpu()
+            torch.cuda.empty_cache()
+            eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+        eigenvalues, eigenvectors = eigenvalues.cpu(), eigenvectors.cpu()
+        del covariance
         order = eigenvalues.argsort(descending=True)
         eigenvalues, basis = eigenvalues[order], eigenvectors[:, order].float()
         explained = (eigenvalues.clamp_min(0).cumsum(0) / eigenvalues.clamp_min(0).sum()).float()

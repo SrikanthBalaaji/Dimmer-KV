@@ -33,7 +33,8 @@ FIELDS = (
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--dictionary", required=True, help="Lexico dictionary fit for this model.")
+    parser.add_argument("--dictionary", default="checkpoints/lexico_dict.pt",
+                        help="Lexico dictionary fit for this model (only for lex / dkv: methods).")
     parser.add_argument("--basis", default="checkpoints/pca_basis.pt", help="Only needed for pca methods.")
     parser.add_argument("--budgets", type=float, nargs="+", default=[0.10, 0.15, 0.20])
     parser.add_argument("--templates", nargs="+", default=list(DEFAULT_TEMPLATES))
@@ -53,7 +54,8 @@ def main() -> None:
     dimmer.install(model)
     methods = Methods(args.model, args.basis, args.dictionary, device, args.recent,
                       model=model, kvtc=args.kvtc)
-    methods.codec("lex")  # Fail early if the dictionary does not match the model.
+    if any(t.startswith(("lex", "dkv:")) for t in args.templates):
+        methods.codec("lex")  # Fail early if the dictionary does not match the model.
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     new_file = not args.output.exists()
