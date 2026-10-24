@@ -13,7 +13,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from kvtc import BIT_OPTIONS, KVTCCodec, rope_tables, split_token_matrix, token_matrix
+from kvtc import BIT_OPTIONS, KVTCCodec, inverse_transform, rope_tables, split_token_matrix, token_matrix
 
 HEADER = np.dtype(np.int32)
 
@@ -117,7 +117,7 @@ def decode_bytes(codec: KVTCCodec, data: bytes, dtype=torch.float16):
                 grouped[:, chosen] = codes.float().view(count, -1, codec.group) * scale + low
             decoded[rows] = grouped.view(count, features)
         matrix = torch.empty(tokens, features, device=codec.device)
-        matrix[start:end] = decoded @ stream.basis.T + stream.mean
+        matrix[start:end] = inverse_transform(decoded, stream, codec.group)
         if exact_rows is not None:
             middle_rows = matrix[start:end]
             middle_rows[exact_rows[0]] = exact_rows[1]

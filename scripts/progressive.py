@@ -27,7 +27,7 @@ from pathlib import Path
 import torch
 
 import dimmer
-from kvtc import KVTCCodec, allocate_rungs, rerotate, rope_tables
+from kvtc import KVTCCodec, allocate_rungs, inverse_transform, rerotate, rope_tables
 
 PLANES = 8
 HEADER_BYTES = 4  # FP16 offset + FP16 range, sent with a group's first plane.
@@ -199,7 +199,7 @@ class ProgressiveCache:
         stream = base.streams[kind]
         planes = self.codec.orders[kind].planes[pieces]
         coefficients = dequantize(store.codes[rows], store.low[rows], store.span[rows], planes)
-        return coefficients @ stream.basis.T + stream.mean
+        return inverse_transform(coefficients, stream, base.group)
 
     def _write(self, tensors: list[torch.Tensor], kind: str, rows: torch.Tensor, matrix_rows: torch.Tensor) -> None:
         base = self.codec.base

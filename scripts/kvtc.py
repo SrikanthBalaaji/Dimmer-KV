@@ -85,6 +85,18 @@ def rung_bytes(bits: torch.Tensor, group: int) -> int:
     return int((bits.float() * group / 8).sum() + GROUP_BYTES_OVERHEAD * used.sum())
 
 
+def inverse_transform(coefficients: torch.Tensor, stream: "Stream", group: int) -> torch.Tensor:
+    """``coefficients @ basis.T + mean``, multiplying only the groups that are
+    non-zero for some row. At low budgets most groups carry 0 bits, so this
+    skips most of the (features x features) basis."""
+    rows, features = coefficients.shape
+    used = (coefficients.view(rows, -1, group) != 0).any(dim=2).any(dim=0)
+    if bool(used.all()):
+        return coefficients @ stream.basis.T + stream.mean
+    columns = used.repeat_interleave(group).nonzero().flatten()
+    return coefficients[:, columns] @ stream.basis[:, columns].T + stream.mean
+
+
 @dataclass
 class Stream:
     mean: torch.Tensor  # [features]
@@ -217,7 +229,7 @@ class KVTCCodec:
                 share = float(rows.float().mean()) / 2
                 name = "exact" if rung == exact_rung else f"{level_bytes[kind][rung] / self.exact_bytes:.3f}"
                 histogram[name] = histogram.get(name, 0.0) + share
-            matrix[start:end] = decoded @ stream.basis.T + stream.mean
+            matrix[start:end] = inverse_transform(decoded, stream, self.group)
             rebuilt[kind] = self.from_matrix(matrix, kind, cos, sin, tensors[0].dtype)
             # Exact tokens keep their original (bit-identical) values.
             for layer, original in enumerate(tensors):
