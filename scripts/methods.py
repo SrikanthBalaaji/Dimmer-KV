@@ -11,7 +11,8 @@ A method name is one of:
   the same, with evenly spaced tokens moved one rung up to fill the budget;
   ``dkvtc@<budget>``: the same transform with DimmerKV flat per-token rungs
   (``kvtc.py``); ``dkvtc@<budget>:snap`` weights each token's error by its
-  question-window attention (summed over layers and heads).
+  question-window attention (summed over layers and heads); ``:ev`` adds a
+  zero-byte eviction level so budgets can go below the coarsest rung.
   These keep the first 4 tokens exact (kvtc's sinks) plus the recent window.
 - ``prog@<budget>``: progressive bit-plane kvtc (``progressive.py``); the
   budget is the hot tier, DimmerKV picks each token's prefix (flat).
@@ -182,16 +183,20 @@ class Methods:
         if name.startswith(("kvtc@", "kvtcf@", "dkvtc@")):
             per_token = name.startswith("dkvtc@")
             budget, *options = name.split("@")[1].split(":")
-            weights = None
-            if options == ["snap"]:
-                weights = torch.stack(scores["snap"]).sum(dim=(0, 1))
-            elif options:
-                raise ValueError(f"Unknown options in {name!r}; only ':snap' is supported.")
-            (new_keys, new_values, used, histogram), seconds = self._timed(lambda: self.codec("kvtc").compress(
+            weights, evict = None, False
+            for option in options:
+                if option == "snap":
+                    weights = torch.stack(scores["snap"]).sum(dim=(0, 1))
+                elif option == "ev" and per_token:
+                    evict = True
+                else:
+                    raise ValueError(f"Unknown option {option!r} in {name!r} (dkvtc supports :snap and :ev).")
+            codec = self.codec("kvtc")
+            (new_keys, new_values, used, histogram), seconds = self._timed(lambda: codec.compress(
                 keys, values, float(budget), self.recent, per_token, fill=name.startswith("kvtcf@"),
-                weights=weights,
+                weights=weights, evict=evict,
             ))
-            return Compressed(new_keys, new_values, None, used, seconds, histogram)
+            return Compressed(new_keys, new_values, codec.last_evicted, used, seconds, histogram)
         if name.startswith("lex@"):
             atoms = self._atoms_for_budget(float(name[4:]), keys[0].shape[-2], keys[0].shape[-1])
             specs = [("lex", atoms), ("lex", atoms)]

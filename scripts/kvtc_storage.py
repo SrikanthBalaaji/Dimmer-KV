@@ -51,6 +51,8 @@ def encode_bytes(codec: KVTCCodec, keys, values, choice: dict, exact_recent: int
         matrix = codec.to_matrix(tensors, kind, cos, sin)
         coefficients = (matrix[start:end] - stream.mean) @ stream.basis
         rungs = choice[kind]
+        if bool((rungs < 0).any()):
+            raise NotImplementedError("Byte storage does not support evicted tokens yet.")
         parts.append(rungs.to(torch.uint8).cpu().numpy().tobytes())
         exact_rung = len(stream.rung_bytes)
         for rung in sorted(rungs.unique().tolist()):

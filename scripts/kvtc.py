@@ -155,13 +155,17 @@ class KVTCCodec:
         )
 
     def compress(self, keys, values, budget: float, exact_recent: int, per_token: bool,
-                 fill: bool = False, weights: torch.Tensor | None = None):
+                 fill: bool = False, weights: torch.Tensor | None = None, evict: bool = False):
         """kvtc (same rung for all) or DimmerKV-TC (per-token rungs) under a budget.
 
         ``fill`` (uniform only) moves an evenly spaced set of tokens one rung up
         to use the leftover budget, so uniform and per-token runs spend the
         same bytes. ``weights`` [tokens] (per-token only) scales each token's
         errors by its importance (mean-normalized over compressed tokens).
+        ``evict`` (per-token only) adds a zero-byte level below the coarsest
+        rung: an evicted key hides the token from attention (its value is then
+        evicted too); an evicted value alone decodes to the mean value. The
+        per-layer eviction masks are left in ``self.last_evicted``.
         Returns rebuilt per-layer keys and values, counted bytes and a histogram.
         """
         tokens = keys[0].shape[2]
@@ -181,18 +185,26 @@ class KVTCCodec:
                 # Relative error so key and value errors are on one scale; exact rung = 0.
                 energy = (matrices[kind][start:end] - stream.mean).square().sum(dim=1).mean()
                 rung_err = self.rung_errors(coefficients[kind], kind) / energy
+                levels = [rung_err, torch.zeros_like(rung_err[:, :1])]
+                if evict:
+                    # Dropping the token loses its whole (centered) vector.
+                    levels.insert(0, (coefficients[kind].square().sum(dim=1) / energy)[:, None])
+                rung_err = torch.cat(levels, dim=1)
                 if weights is not None:
                     importance = weights[start:end].float()
                     rung_err = rung_err * (importance / importance.mean().clamp_min(1e-12))[:, None]
-                errors.append(torch.cat([rung_err, torch.zeros_like(rung_err[:, :1])], dim=1))
+                errors.append(rung_err)
 
         level_bytes = {kind: self.streams[kind].rung_bytes + [self.exact_bytes] for kind in ("key", "value")}
+        evict_bytes = [0] if evict else []
         if per_token:
             chosen = allocate_rungs(
-                torch.cat(errors), torch.tensor(level_bytes["key"] + level_bytes["value"], device=self.device),
+                torch.cat(errors),
+                torch.tensor(evict_bytes + level_bytes["key"] + evict_bytes + level_bytes["value"], device=self.device),
                 middle, remaining,
-            )
-            choice = {"key": chosen[:middle], "value": chosen[middle:]}
+            ) - len(evict_bytes)  # -1 = evicted.
+            choice = {"key": chosen[:middle], "value": chosen[middle:].clone()}
+            choice["value"][choice["key"] < 0] = -1  # A hidden token needs no value.
         else:
             # Uniform: the finest rung (same for K and V) that fits.
             fits = [r for r in range(len(level_bytes["key"]))
@@ -212,6 +224,9 @@ class KVTCCodec:
                         choice[kind][picked] = rung + 1
 
         self.last_choice = choice  # Per-token rungs, for kvtc_storage.encode_bytes.
+        hidden = torch.zeros(tokens, dtype=torch.bool, device=self.device)
+        hidden[start:end] = choice["key"] < 0
+        self.last_evicted = [hidden[None].expand(self.heads, -1) for _ in range(self.layers)] if evict else None
         used = (tokens - middle) * 2 * self.exact_bytes
         rebuilt, histogram = {}, {}
         for kind, tensors in (("key", keys), ("value", values)):
@@ -221,6 +236,9 @@ class KVTCCodec:
             exact_rung = len(stream.rung_bytes)
             for rung in choice[kind].unique().tolist():
                 rows = choice[kind] == rung
+                if rung < 0:  # Evicted: no bytes; coefficients stay 0 (mean vector).
+                    histogram["evict"] = histogram.get("evict", 0.0) + float(rows.float().mean()) / 2
+                    continue
                 used += int(rows.sum()) * level_bytes[kind][rung]
                 if rung == exact_rung:
                     decoded[rows] = coefficients[kind][rows]
