@@ -188,29 +188,85 @@ def heat_map(head_ids, token_bytes: torch.Tensor | None, highlight: str | None) 
                      + "".join(out) + "</div>")
 
 
+def token_summary(token_bytes: torch.Tensor | None) -> str:
+    """One line: how the method treated the document's tokens."""
+    if token_bytes is None:
+        return ""
+    full = 2.0 * config.layers * config.kv_heads * config.head_dim * 2
+    share = (token_bytes.float() / full).cpu()
+    groups = {
+        "dropped": share <= 0,
+        "coarse (<3% of FP16)": (share > 0) & (share < 0.03),
+        "medium (3–20%)": (share >= 0.03) & (share < 0.2),
+        "fine (20–99%)": (share >= 0.2) & (share < 0.99),
+        "exact": share >= 0.99,
+    }
+    parts = [f"{name} {float(mask.float().mean()):.0%}" for name, mask in groups.items() if bool(mask.any())]
+    return "**Tokens:** " + " · ".join(parts)
+
+
+def resolve_question(sample: int, question_choice: str, custom_question: str):
+    context, qa = sample_document(int(sample))
+    if custom_question.strip():
+        return context, custom_question.strip(), None
+    questions = [q for q, _ in qa]
+    index = questions.index(question_choice) if question_choice in questions else 0
+    return context, qa[index][0], qa[index][1]
+
+
+def document_header(head_ids, prefill_ms: float, in_prompt: bool) -> str:
+    when = "known before compression" if in_prompt else "asked after compression"
+    return (f"**Document:** {head_ids.shape[0]:,} tokens · full KV cache "
+            f"{head_ids.shape[0] * config.fp16_bytes_per_token() / 2**20:.1f} MB · re-reading it (prefill) "
+            f"took {prefill_ms:.0f} ms · question {when}")
+
+
 def run(sample: int, question_choice: str, custom_question: str, in_prompt: bool, budget_percent: float,
         left: str, right: str):
-    context, qa = sample_document(int(sample))
-    expected = None
-    if custom_question.strip():
-        question = custom_question.strip()
-    else:
-        index = [q for q, _ in qa].index(question_choice) if question_choice in [q for q, _ in qa] else 0
-        question, expected = qa[index]
+    context, question, expected = resolve_question(sample, question_choice, custom_question)
     head_ids, tail_ids, keys, values, scores, prefill_ms = prefill(context, question, in_prompt)
     budget = budget_percent / 100
     outputs = []
     for label in (left, right):
         try:
             result = run_method(label, budget, head_ids, tail_ids, keys, values, scores)
-            outputs.append((card(label, result, expected), heat_map(head_ids, result["token_bytes"], expected)))
+            outputs.append((card(label, result, expected) + "\n\n" + token_summary(result["token_bytes"]),
+                            heat_map(head_ids, result["token_bytes"], expected)))
         except (ValueError, AssertionError) as error:
             outputs.append((f"### {label}\n\n⚠️ {error}\n\n(kvtc needs ≥ ~2.8% at 3K tokens; "
                             "use DimmerKV + eviction or a larger budget.)", ""))
-    header = (f"**Document:** {head_ids.shape[0]:,} tokens · full KV cache "
-              f"{head_ids.shape[0] * config.fp16_bytes_per_token() / 2**20:.1f} MB · re-reading it (prefill) "
-              f"took {prefill_ms:.0f} ms · question {'in the prompt' if in_prompt else 'asked after compression'}")
-    return header, outputs[0][0], outputs[1][0], outputs[0][1], outputs[1][1]
+    return (document_header(head_ids, prefill_ms, in_prompt),
+            outputs[0][0], outputs[1][0], outputs[0][1], outputs[1][1])
+
+
+def run_all(sample: int, question_choice: str, custom_question: str, in_prompt: bool, budget_percent: float):
+    """Every method on the same question and budget: a leaderboard and a size chart."""
+    import pandas as pd
+
+    context, question, expected = resolve_question(sample, question_choice, custom_question)
+    head_ids, tail_ids, keys, values, scores, prefill_ms = prefill(context, question, in_prompt)
+    budget = budget_percent / 100
+    per_ram = f"Conversations / {RAM_GIB} GiB"
+    rows = []
+    for label in METHODS:
+        short = label.split(" (")[0]
+        try:
+            r = run_method(label, budget, head_ids, tail_ids, keys, values, scores)
+        except (ValueError, AssertionError):
+            rows.append({"Method": short, "Answer": "—", "Correct": "budget too small", "Stored MB": None,
+                         "× smaller": None, per_ram: None, "Compress ms": None, "Restore / refine ms": None})
+            continue
+        correct = ("✅" if expected in r["reply"] else "❌") if expected else "?"
+        extra = r["restore_ms"] if r["restore_ms"] is not None else r["refine_ms"]
+        rows.append({
+            "Method": short, "Answer": r["reply"][:24], "Correct": correct,
+            "Stored MB": round(r["stored"] / 2**20, 2), "× smaller": round(r["full"] / max(r["stored"], 1), 1),
+            per_ram: int(RAM_GIB * 2**30 // max(r["stored"], 1)),
+            "Compress ms": round(r["compress_ms"]), "Restore / refine ms": None if extra is None else round(extra),
+        })
+    table = pd.DataFrame(rows)
+    chart = table.dropna(subset=["× smaller"])[["Method", "× smaller", "Correct"]]
+    return document_header(head_ids, prefill_ms, in_prompt), table, chart
 
 
 def update_questions(sample: int):
@@ -219,42 +275,98 @@ def update_questions(sample: int):
     return gr.update(choices=choices, value=choices[0])
 
 
+SCENARIOS = {
+    "1 · Question after compression (4%)": dict(in_prompt=False, budget=4, left="H2O (evict by attention)",
+                                                right="DimmerKV (per-token precision)"),
+    "2 · Question known in advance (2%)": dict(in_prompt=True, budget=2, left="SnapKV (evict, sees the question)",
+                                               right="DimmerKV + question scores + eviction"),
+    "3 · Hard case + refinement (3%)": dict(in_prompt=False, budget=3, left="kvtc (same precision for every token)",
+                                            right="DimmerKV progressive + refine top 1% at question time"),
+}
+
+
+def apply_scenario(name: str):
+    sc = SCENARIOS[name]
+    return (gr.update(value=sc["in_prompt"]), gr.update(value=sc["budget"]), gr.update(value=sc["left"]),
+            gr.update(value=sc["right"]))
+
+
+def architecture_svg() -> str:
+    """The architecture diagram from docs/DimmerKV_overview.html (one source of truth)."""
+    import re
+    from pathlib import Path
+
+    page = Path(__file__).resolve().parent.parent / "docs" / "DimmerKV_overview.html"
+    try:
+        match = re.search(r'<svg id="dimmerkv-architecture".*?</svg>', page.read_text(encoding="utf-8"), re.S)
+    except OSError:
+        match = None
+    if not match:
+        return "<p>Architecture diagram: see docs/DimmerKV_overview.html.</p>"
+    return f'<div style="background:#fbfaf7;border-radius:12px;padding:8px;overflow-x:auto">{match.group(0)}</div>'
+
+
+HOW_IT_WORKS = """
+### The pipeline in five steps
+1. **Calibrate once per model**: undo RoPE on keys, join all layers and heads of a token into one
+   vector, fit one PCA basis, and order (group, bit-plane) pieces by error removed per byte (kvtc-style).
+2. **Compress once per conversation**: every token is quantized once at 8 bits; DimmerKV decides how
+   many bit-planes each token keeps (dropped, coarse … fine), by error per byte, weighted by the
+   question's attention when the question is known. The first 4 and last 32 tokens stay exact.
+3. **Store**: bit-pack + DEFLATE; a hot tier with each token's first planes, a cold tier with the rest.
+4. **Restore per question**: decode only the PCA groups that carry bits and re-apply RoPE; optionally
+   score the restored cache with the question and fetch the full planes for its top ~1% of tokens.
+5. **Answer**: the model attends over a normal FP16 cache (same speed), with dropped tokens masked.
+
+**Why this pipeline:** eviction (H2O) deletes facts that a later question needs; per-head PCA and Lexico
+were too lossy or too slow; kvtc's cross-layer transform keeps nearly everything at 2–5%; DimmerKV's
+per-token precision, question scores and question-time refinement spend the remaining bytes where
+they matter. Full write-up: `docs/DimmerKV_overview.html`.
+"""
+
 RESULTS = """
-### Measured results (Llama-3.2-1B on the laptop, 3B on an AWS L40S)
+### Measured results (Llama-3.2-1B on the laptop, Llama-3.2-3B on an AWS L40S)
 
-**Question in the prompt, 8K-token documents, 24 questions** (full cache: 21/24)
+**Question known before compression, 8K-token documents**
 
-| method | memory | correct |
+| method | 1B, 1.5% | 1B, 2% | 3B, 2% |
+|---|---|---|---|
+| full cache | 21/24 | 21/24 | 36/36 |
+| SnapKV | 6/24 | 10/24 | 34/36 |
+| kvtc | — | 17/24 | 35/36 |
+| **DimmerKV + question scores (+ eviction on 1B)** | **21/24** | **22/24** | **36/36** |
+
+**Question asked after compression, 8K tokens** (full cache: 1B 21/24, ans p .75)
+
+| method | 1B, 2% | 3B, 2% |
 |---|---|---|
-| SnapKV | 1.5% | 6/24 |
-| **DimmerKV + question scores + eviction** | **1.5% (67×)** | **21/24** |
-| SnapKV | 2% | 10/24 |
-| **DimmerKV + question scores + eviction** | **2% (50×)** | **22/24** |
-
-**Question asked after compression, 8K tokens** (full cache: 21/24, ans p .75)
-
-| method | memory | correct / ans p |
-|---|---|---|
-| H2O | 2% | 0/24 / .00 |
-| kvtc | 2% | 17/24 / .51 |
-| **DimmerKV progressive, refine top 1% at question time (+0.5% fetched)** | 2% | **19/24 / .71** |
+| H2O | 0/24 | 0/36 |
+| kvtc | 17/24 (.51) | 36/36 |
+| **DimmerKV progressive, refine top 1% (+0.5% fetched)** | **19/24 (.71)** | **36/36** |
 
 **Serving, 3B model, 16K-token conversations** (18 questions)
 
-| way of keeping a conversation | stored | conversations in 8 GiB | correct |
-|---|---|---|---|
-| full cache in RAM | 1,753 MiB | 4 | 18/18 |
-| H2O 2% | 35 MiB | 230 | 0/18 |
-| kvtc / DimmerKV 2% | 31 MiB | 263 | 18/18 |
+| way of keeping a conversation | stored | conversations in 8 GiB | first answer token | correct |
+|---|---|---|---|---|
+| full cache in RAM | 1,753 MiB | 4 | 189 ms | 18/18 |
+| re-read the text | ~0 | unlimited | 1,434 ms | 18/18 |
+| H2O 2% | 35 MiB | 230 | 61 ms | 0/18 |
+| **kvtc / DimmerKV 2%** | **31 MiB** | **263 (57×)** | **488–627 ms** | **18/18** |
 
-Eviction (H2O, SnapKV) loses facts that a question needs; DimmerKV keeps every
-token at some precision and spends bytes where they matter. Details: FINDINGS.md.
+**Perplexity, 3B, 8K tokens** (full 8.33): H2O 10.64 · SnapKV 10.25 · kvtc 8.48 · DimmerKV + question
+scores 8.46 (2% budget).
+
+Savings are in storage and transfer; during answering the model uses a normal FP16 cache.
+Details: `FINDINGS.md`, `docs/DimmerKV_overview.html`.
 """
 
 with gr.Blocks(title="DimmerKV") as demo:
-    gr.Markdown("# DimmerKV — dim the KV cache instead of deleting it\n"
-                "Compress a document's memory (KV cache), then ask about a fact hidden in it.")
+    gr.Markdown("# DimmerKV: dim the KV cache instead of deleting it\n"
+                "Compress a document's memory (KV cache) to a few percent, then ask about a fact hidden in it.")
     with gr.Tab("Compress & ask"):
+        gr.Markdown("**Quick scenarios** (set the controls and run):")
+        with gr.Row():
+            scenario_buttons = [gr.Button(name, size="sm") for name in SCENARIOS]
         with gr.Row():
             sample = gr.Dropdown(choices=list(range(10)), value=0, label="Sample document (WikiText + 6 hidden facts)")
             first_qa = sample_document(0)[1]
@@ -266,19 +378,36 @@ with gr.Blocks(title="DimmerKV") as demo:
         with gr.Row():
             left = gr.Dropdown(list(METHODS), value="H2O (evict by attention)", label="Method A")
             right = gr.Dropdown(list(METHODS), value="DimmerKV (per-token precision)", label="Method B")
-        go = gr.Button("Compress & answer", variant="primary")
+        with gr.Row():
+            go = gr.Button("Compress & answer (A vs B)", variant="primary")
+            go_all = gr.Button("Run all methods")
         header = gr.Markdown()
         with gr.Row():
             card_a = gr.Markdown()
             card_b = gr.Markdown()
-    with gr.Tab("Heat map"):
-        gr.Markdown("Bytes kept per token for the last run (method A, then method B).")
-        heat_a = gr.HTML()
-        heat_b = gr.HTML()
+        with gr.Accordion("Per-token heat maps (bytes kept per token; red outline = the answer)", open=True):
+            with gr.Row():
+                heat_a = gr.HTML()
+                heat_b = gr.HTML()
+        with gr.Accordion("All methods on this question", open=False) as all_box:
+            board = gr.Dataframe(interactive=False, wrap=True)
+            chart = gr.BarPlot(x="Method", y="× smaller", color="Correct", title="How much smaller (× vs FP16)",
+                               height=320)
+    with gr.Tab("How it works"):
+        gr.HTML(architecture_svg())
+        gr.Markdown(HOW_IT_WORKS)
     with gr.Tab("Results"):
         gr.Markdown(RESULTS)
+
     sample.change(update_questions, sample, question)
-    go.click(run, [sample, question, custom, in_prompt, budget, left, right], [header, card_a, card_b, heat_a, heat_b])
+    run_inputs = [sample, question, custom, in_prompt, budget, left, right]
+    run_outputs = [header, card_a, card_b, heat_a, heat_b]
+    for button, name in zip(scenario_buttons, SCENARIOS):
+        button.click(lambda name=name: apply_scenario(name), None, [in_prompt, budget, left, right]) \
+            .then(run, run_inputs, run_outputs)
+    go.click(run, run_inputs, run_outputs)
+    go_all.click(run_all, [sample, question, custom, in_prompt, budget], [header, board, chart]) \
+        .then(lambda: gr.update(open=True), None, all_box)
 
 if __name__ == "__main__":
     demo.launch(server_name="127.0.0.1", server_port=7860)

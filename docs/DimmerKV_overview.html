@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DimmerKV Overview</title>
+<meta name="description" content="DimmerKV: dim the KV cache instead of deleting it. What we built at Hashcode 14.0, the pipeline we kept and why, the architecture, and the measured results.">
+<style>
+  :root {
+    --bg: #fbfaf7;
+    --surface: #ffffff;
+    --surface-2: #f3f1ec;
+    --text: #1d1c1a;
+    --muted: #5f5c55;
+    --line: #dcd8cf;
+    --accent: #b7791f;
+    --accent-soft: #fbefd9;
+    --ours: #b7791f;
+    --ours-soft: #fdf3e1;
+    --credit: #2f6f9f;
+    --credit-soft: #e6f0f7;
+    --model: #5b6b48;
+    --model-soft: #edf1e6;
+    --good: #2e7d4f;
+    --bad: #b33a3a;
+    --code: #f0ede6;
+    --shadow: 0 1px 2px rgba(0,0,0,.05), 0 4px 16px rgba(0,0,0,.04);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #141413;
+      --surface: #1c1c1a;
+      --surface-2: #232320;
+      --text: #ecebe6;
+      --muted: #a9a69d;
+      --line: #3a3934;
+      --accent: #e3a548;
+      --accent-soft: #3a2d17;
+      --ours: #e3a548;
+      --ours-soft: #33281a;
+      --credit: #7fb2d9;
+      --credit-soft: #1d2a33;
+      --model: #a9bf8c;
+      --model-soft: #232a1c;
+      --good: #6cc48f;
+      --bad: #ef7d7d;
+      --code: #26251f;
+      --shadow: none;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #141413;
+    --surface: #1c1c1a;
+    --surface-2: #232320;
+    --text: #ecebe6;
+    --muted: #a9a69d;
+    --line: #3a3934;
+    --accent: #e3a548;
+    --accent-soft: #3a2d17;
+    --ours: #e3a548;
+    --ours-soft: #33281a;
+    --credit: #7fb2d9;
+    --credit-soft: #1d2a33;
+    --model: #a9bf8c;
+    --model-soft: #232a1c;
+    --good: #6cc48f;
+    --bad: #ef7d7d;
+    --code: #26251f;
+    --shadow: none;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 980px; margin: 0 auto; padding: 32px 16px 80px; }
+  header.hero { padding: 24px 0 8px; }
+  .eyebrow { color: var(--accent); font-weight: 600; letter-spacing: .04em; text-transform: uppercase; font-size: 13px; }
+  h1 { font-size: clamp(30px, 5vw, 44px); line-height: 1.15; margin: 8px 0 12px; }
+  h2 { font-size: 26px; margin: 56px 0 12px; padding-top: 8px; border-top: 1px solid var(--line); }
+  h3 { font-size: 19px; margin: 28px 0 8px; }
+  p { margin: 0 0 14px; }
+  .lede { font-size: 19px; color: var(--muted); max-width: 760px; }
+  nav.toc { display: flex; flex-wrap: wrap; gap: 8px; margin: 20px 0 8px; }
+  nav.toc a {
+    color: var(--text); text-decoration: none; font-size: 14px;
+    padding: 6px 12px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface);
+  }
+  nav.toc a:hover { border-color: var(--accent); }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin: 24px 0; }
+  .stat { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 16px; box-shadow: var(--shadow); }
+  .stat .num { font-size: 30px; font-weight: 700; color: var(--accent); line-height: 1.1; }
+  .stat .label { color: var(--muted); font-size: 14px; margin-top: 6px; }
+  .callout { background: var(--accent-soft); border-left: 4px solid var(--accent); border-radius: 8px; padding: 14px 16px; margin: 18px 0; }
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 16px; box-shadow: var(--shadow); }
+  .card h3 { margin-top: 0; }
+  .tag { display: inline-block; font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px; margin-right: 6px; }
+  .tag.kept { background: var(--model-soft); color: var(--good); }
+  .tag.dropped { background: var(--surface-2); color: var(--bad); }
+  .tag.ours { background: var(--ours-soft); color: var(--ours); }
+  .tag.credit { background: var(--credit-soft); color: var(--credit); }
+  ol.timeline { list-style: none; padding: 0; margin: 16px 0; counter-reset: step; }
+  ol.timeline li { position: relative; padding: 0 0 18px 44px; counter-increment: step; }
+  ol.timeline li::before {
+    content: counter(step); position: absolute; left: 0; top: 0; width: 28px; height: 28px;
+    border-radius: 50%; background: var(--surface); border: 2px solid var(--accent); color: var(--accent);
+    font-weight: 700; font-size: 13px; display: grid; place-items: center;
+  }
+  ol.timeline li::after { content: ""; position: absolute; left: 13px; top: 30px; bottom: 2px; width: 2px; background: var(--line); }
+  ol.timeline li:last-child::after { display: none; }
+  ol.timeline strong { display: block; }
+  ol.timeline .res { color: var(--muted); font-size: 15px; }
+  .table-wrap { overflow-x: auto; margin: 12px 0 20px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; font-size: 14.5px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { background: var(--surface-2); font-weight: 600; white-space: nowrap; }
+  tr:last-child td { border-bottom: none; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tr.hl td { background: var(--ours-soft); font-weight: 600; }
+  .good { color: var(--good); font-weight: 600; }
+  .bad { color: var(--bad); font-weight: 600; }
+  code { background: var(--code); padding: 1px 6px; border-radius: 5px; font-size: 0.92em; }
+  .diagram { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 12px; margin: 16px 0; box-shadow: var(--shadow); }
+  .diagram svg { width: 100%; height: auto; display: block; }
+  .diagram { overflow-x: auto; }
+  .swipe-hint { display: none; color: var(--muted); font-size: 13px; margin: 0 4px 6px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 13.5px; color: var(--muted); margin: 8px 4px 0; }
+  .legend span::before { content: ""; display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; border: 1.5px solid; }
+  .legend .l-ours::before { background: var(--ours-soft); border-color: var(--ours); }
+  .legend .l-credit::before { background: var(--credit-soft); border-color: var(--credit); }
+  .legend .l-model::before { background: var(--model-soft); border-color: var(--model); }
+  .legend .l-plain::before { background: var(--surface-2); border-color: var(--line); }
+  ul.tight { margin: 6px 0 14px; padding-left: 20px; }
+  ul.tight li { margin: 4px 0; }
+  footer { color: var(--muted); font-size: 14px; margin-top: 56px; border-top: 1px solid var(--line); padding-top: 16px; }
+  .theme-toggle {
+    position: fixed; top: 12px; right: 12px; z-index: 5; font: inherit; font-size: 13px;
+    background: var(--surface); color: var(--text); border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; cursor: pointer;
+  }
+  @media (max-width: 600px) {
+    body { font-size: 15px; }
+    h2 { font-size: 22px; }
+    .stat .num { font-size: 26px; }
+    th, td { padding: 8px 9px; }
+  }
+  @media (max-width: 760px) {
+    .diagram svg { min-width: 760px; }
+    .swipe-hint { display: block; }
+  }
+</style>
+</head>
+<body>
+<button class="theme-toggle" type="button" id="themeToggle" aria-label="Toggle light or dark theme">Theme</button>
+<main>
+
+<header class="hero">
+  <div class="eyebrow">Hashcode 14.0 · Track 01 LLM Inference · Team Deadoop</div>
+  <h1>DimmerKV: dim the KV cache instead of deleting it</h1>
+  <p class="lede">A language model's memory of what it has read (the KV cache) is large. The usual way to shrink it is to throw tokens away, which loses facts that a later question needs. DimmerKV keeps every token, at a precision that matches how much it matters, and sharpens the right tokens when a question arrives.</p>
+  <nav class="toc" aria-label="Sections">
+    <a href="#problem">Problem</a>
+    <a href="#journey">What we tried</a>
+    <a href="#pipeline">Final pipeline</a>
+    <a href="#architecture">Architecture</a>
+    <a href="#results">Results</a>
+    <a href="#limits">Limits</a>
+    <a href="#credits">Credits</a>
+  </nav>
+  <div class="stats">
+    <div class="stat"><div class="num">50–67×</div><div class="label">smaller cache that still matches the full cache on hidden-fact questions (question known, 8K tokens)</div></div>
+    <div class="stat"><div class="num">57×</div><div class="label">more conversations per GiB of RAM, 3B model, 16K tokens, 18/18 answers correct</div></div>
+    <div class="stat"><div class="num">0 / 36</div><div class="label">answers H2O-style eviction gets when the question comes after compression</div></div>
+    <div class="stat"><div class="num">2.3×</div><div class="label">faster first answer token than re-reading the conversation (3B, 16K tokens)</div></div>
+  </div>
+</header>
+
+<section id="problem">
+<h2>The problem</h2>
+<p>For every token a model has read, it stores a key and a value vector in every layer and attention head. For Llama-3.2-3B that is about 112 KB per token, so a 16,000-token conversation needs <strong>1.75 GB</strong>. A server that keeps conversations between turns runs out of memory quickly, and recomputing a conversation from its text costs a full re-read.</p>
+<p>The common fix is <strong>eviction</strong> (H2O, SnapKV): keep the tokens that received the most attention and delete the rest. That works when the model already knows what it will be asked. When the question comes <em>after</em> compression, the facts it needs were never heavily attended, so they are the first to go.</p>
+<div class="callout"><strong>Measured:</strong> before any question exists, the hidden facts rank at the 30–35th percentile of H2O's attention scores. H2O then answers <strong>0 of 36</strong> such questions on the 3B model, at every budget we tried, while the full cache answers 36 of 36.</div>
+<p><strong>Our idea:</strong> don't make a keep-or-delete decision. Keep every token, but at a precision ("brightness") chosen per token, so a byte budget is spent where it matters, and refine the relevant tokens once the question is known.</p>
+</section>
+
+<section id="journey">
+<h2>What we tried, in order</h2>
+<p>Every step was tested on the same "needle" test: facts like <em>"The access code for the Orion locker is 7311"</em> hidden in WikiText, then asked about. Budgets are the compressed size as a share of the normal FP16 cache (2% = 50× smaller).</p>
+<ol class="timeline">
+  <li><strong>Per-head PCA codec</strong><span class="res">Fit a PCA basis per layer and head; store each vector as its top components. Too lossy: 1/18 facts at 27% memory. <span class="tag dropped">dropped</span></span></li>
+  <li><strong>Lexico sparse dictionary</strong><span class="res">Each vector picks a few of 4,096 learned atoms. Far more accurate per byte (16/18 at 27%), but encoding was slow. <span class="tag dropped">kept as ablation</span></span></li>
+  <li><strong>DimmerKV allocator with H2O scores</strong><span class="res">Precision per token by attention × error. Failed after compression (0/18): attention points away from the facts. This is the finding that shaped everything after. <span class="tag dropped">dropped as the default signal</span></span></li>
+  <li><strong>"Flat" allocation by error per byte</strong><span class="res">Give bytes to tokens that are hard to compress, ignoring attention. Doubled uniform Lexico at equal bytes (10 vs 5 of 18 at 15%). <span class="tag kept">kept</span></span></li>
+  <li><strong>Question-window scores</strong><span class="res">When the question is in the prompt, score tokens by the question's attention (SnapKV-style) and grade precision instead of evicting: 17/18 at 15% vs SnapKV 10/18. <span class="tag kept">kept</span></span></li>
+  <li><strong>kvtc-style transform coding</strong><span class="res">Concatenate all layers and heads per token, remove RoPE from keys, one cross-layer PCA, grouped 0/2/4/8-bit quantization (Staniszewski &amp; Łańcucki, ICLR 2026). About 25× smaller with near-full accuracy and 10× faster than Lexico. <span class="tag kept">became the codec</span></span></li>
+  <li><strong>DimmerKV on kvtc</strong><span class="res">Per-token precision on top of kvtc beat kvtc at equal bytes in every needle setting; the biggest gain with question scores (ans p .76 → .91 at 3%). <span class="tag kept">kept</span></span></li>
+  <li><strong>Real storage and serving benchmarks</strong><span class="res">Bit-packed bytes plus DEFLATE, restored exactly; measured in MB, ms and tokens/s on 3K–16K-token conversations. <span class="tag kept">kept</span></span></li>
+  <li><strong>Progressive bit-planes + question-time refinement</strong><span class="res">Encode once at 8 bits, store planes most-important first; keep a small hot prefix, fetch the rest only for the tokens the question needs. Fixed most of the "question after compression" gap: ans p .50 → .71 (full .75) for 0.5% extra bytes. <span class="tag kept">kept</span></span></li>
+  <li><strong>Eviction as a zero-byte precision level</strong><span class="res">Lets DimmerKV mix dropping with graded precision under one budget. With question scores it matched the full cache at 1.5–2% (21–22 vs 21 of 24); SnapKV got 6–10. <span class="tag kept">kept</span></span></li>
+  <li><strong>Partial-basis decode</strong><span class="res">Decode only the PCA groups that carry bits. Restore 4× faster; on the 3B model restoring became 2.3× faster than re-reading. <span class="tag kept">kept</span></span></li>
+  <li><strong>3B model on an AWS L40S</strong><span class="res">The same conclusions on a bigger model; the kvtc family stays at or near the full cache down to 2%, eviction collapses. <span class="tag kept">validated</span></span></li>
+</ol>
+</section>
+
+<section id="pipeline">
+<h2>The pipeline we kept, and why</h2>
+<div class="grid2">
+  <div class="card">
+    <h3><span class="tag credit">kvtc</span>Cross-layer transform</h3>
+    <p>Per token, keys (RoPE removed) from every layer and head form one vector (8,192 numbers on 1B, 28,672 on 3B), likewise values; one PCA basis fitted once on about 100K WikiText tokens.</p>
+    <p><strong>Why:</strong> layers and heads are highly redundant, which per-head PCA and Lexico cannot exploit. It is the single biggest jump in quality: from losing facts at 10–20% to keeping them at 2–4%.</p>
+  </div>
+  <div class="card">
+    <h3><span class="tag ours">ours</span>Progressive bit-planes</h3>
+    <p>Each group of 64 components is quantized once at 8 bits; the top <em>m</em> bits are a valid <em>m</em>-bit code. Pieces (group, plane) are ordered once by error removed per byte.</p>
+    <p><strong>Why:</strong> one encoding serves every precision, so tiers, refinement and demotion need no re-encoding. It is also 10–30% more accurate than kvtc's fixed 0/2/4/8-bit ladder at the same size.</p>
+  </div>
+  <div class="card">
+    <h3><span class="tag ours">ours</span>DimmerKV allocator</h3>
+    <p>Measures every token's error at every precision step and hands out upgrades greedily by error removed per byte, under one byte budget, with a zero-byte "dropped" level.</p>
+    <p><strong>Why:</strong> attention before the question misleads, so the default weight is flat (error only); when the question is visible, its attention weights the errors. Graded precision beats keep-or-drop at equal bytes.</p>
+  </div>
+  <div class="card">
+    <h3><span class="tag ours">ours</span>Question-time refinement</h3>
+    <p>When a question arrives, score the restored hot cache with it, fetch the remaining planes for the top ~1% of tokens, and rebuild only those.</p>
+    <p><strong>Why:</strong> it uses the real question instead of guessing importance in advance, which is the only signal that worked when the question comes later.</p>
+  </div>
+  <div class="card">
+    <h3><span class="tag ours">ours</span>Storage and fast restore</h3>
+    <p>Bit-packed codes, FP16 scales, per-token level ids, then DEFLATE. Restore decodes only PCA groups that carry bits and re-applies RoPE.</p>
+    <p><strong>Why:</strong> the byte accounting is real (stored = counted + 0.1%) and restore must beat re-reading, or compression costs latency.</p>
+  </div>
+  <div class="card">
+    <h3><span class="tag credit">StreamingLLM / kvtc</span>Exact sinks and recent window</h3>
+    <p>The first 4 tokens and the last 32 stay exact FP16.</p>
+    <p><strong>Why:</strong> models attend to these heavily; compressing them hurts disproportionately for a tiny saving.</p>
+  </div>
+</div>
+<h3>What we dropped</h3>
+<ul class="tight">
+  <li><strong>Per-head PCA:</strong> loses facts below ~40% of FP16.</li>
+  <li><strong>Lexico as the main codec:</strong> 2–5× less accurate than kvtc at equal bytes and 5–10× slower to encode; kept as an ablation (it is a required track paper).</li>
+  <li><strong>H2O's summed attention as importance:</strong> it ranks the facts below average before the question exists; kept as the baseline and as the scoring idea behind question-window scores.</li>
+  <li><strong>Mixing codecs for keys and values:</strong> keys are the fragile stream; mixes were always worse.</li>
+</ul>
+</section>
+
+<section id="architecture">
+<h2>Architecture</h2>
+<p>How the pieces connect: calibration runs once per model, compression once per conversation, restore and refinement once per question. One method-name registry (<code>methods.py</code>) feeds every evaluation script and the demo.</p>
+<p class="swipe-hint">Swipe sideways to see the whole diagram.</p>
+<div class="diagram" role="img" aria-label="DimmerKV architecture diagram">
+<svg id="dimmerkv-architecture" viewBox="0 0 960 1010" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" style="fill: var(--muted, #6b6860)"/>
+    </marker>
+    <style>
+      .band { fill: var(--surface-2, #f3f1ec); stroke: var(--line, #dcd8cf); stroke-width: 1.2; }
+      .band-title { fill: var(--text, #1d1c1a); font-size: 15px; font-weight: 700; }
+      .band-sub { fill: var(--muted, #5f5c55); font-size: 12px; }
+      .box { fill: var(--surface, #ffffff); stroke: var(--line, #c9c4b8); stroke-width: 1.4; }
+      .box.ours { fill: var(--ours-soft, #fdf3e1); stroke: var(--ours, #b7791f); }
+      .box.credit { fill: var(--credit-soft, #e6f0f7); stroke: var(--credit, #2f6f9f); }
+      .box.model { fill: var(--model-soft, #edf1e6); stroke: var(--model, #5b6b48); }
+      .t { fill: var(--text, #1d1c1a); font-size: 13px; font-weight: 600; }
+      .s { fill: var(--muted, #5f5c55); font-size: 11px; }
+      .edge { stroke: var(--muted, #6b6860); stroke-width: 1.5; fill: none; }
+      .edge.dash { stroke-dasharray: 5 4; }
+      .lbl { fill: var(--muted, #5f5c55); font-size: 11px; font-style: italic; }
+    </style>
+  </defs>
+
+  <!-- Band 1: calibration -->
+  <rect class="band" x="10" y="10" width="940" height="150" rx="14"/>
+  <text class="band-title" x="28" y="36">1 · Once per model: calibration</text>
+  <text class="band-sub" x="28" y="54">fit_kvtc.py, fit_progressive.py (~1–5 min on one GPU)</text>
+  <rect class="box" x="28" y="70" width="150" height="70" rx="10"/>
+  <text class="t" x="103" y="98" text-anchor="middle">WikiText</text>
+  <text class="s" x="103" y="116" text-anchor="middle">~100K tokens</text>
+  <rect class="box model" x="210" y="70" width="160" height="70" rx="10"/>
+  <text class="t" x="290" y="98" text-anchor="middle">Llama prefill</text>
+  <text class="s" x="290" y="116" text-anchor="middle">collect keys and values</text>
+  <rect class="box credit" x="402" y="70" width="170" height="70" rx="10"/>
+  <text class="t" x="487" y="94" text-anchor="middle">Undo RoPE, concat</text>
+  <text class="s" x="487" y="111" text-anchor="middle">all layers × heads per token</text>
+  <text class="s" x="487" y="126" text-anchor="middle">8,192 (1B) · 28,672 (3B) dims</text>
+  <rect class="box credit" x="604" y="70" width="150" height="70" rx="10"/>
+  <text class="t" x="679" y="98" text-anchor="middle">Cross-layer PCA</text>
+  <text class="s" x="679" y="116" text-anchor="middle">one basis + mean</text>
+  <rect class="box ours" x="786" y="70" width="150" height="70" rx="10"/>
+  <text class="t" x="861" y="94" text-anchor="middle">Bit-plane order</text>
+  <text class="s" x="861" y="111" text-anchor="middle">(group, plane) pieces</text>
+  <text class="s" x="861" y="126" text-anchor="middle">by error per byte</text>
+  <path class="edge" d="M178 105 H208" marker-end="url(#arrow)"/>
+  <path class="edge" d="M370 105 H400" marker-end="url(#arrow)"/>
+  <path class="edge" d="M572 105 H602" marker-end="url(#arrow)"/>
+  <path class="edge" d="M754 105 H784" marker-end="url(#arrow)"/>
+
+  <!-- Band 2: compress -->
+  <rect class="band" x="10" y="180" width="940" height="330" rx="14"/>
+  <text class="band-title" x="28" y="206">2 · Once per conversation: compress</text>
+  <text class="band-sub" x="28" y="224">methods.py → progressive.py / kvtc.py / dimmer.py, then kvtc_storage.py</text>
+  <rect class="box" x="28" y="242" width="150" height="70" rx="10"/>
+  <text class="t" x="103" y="270" text-anchor="middle">Document</text>
+  <text class="s" x="103" y="288" text-anchor="middle">(question optional)</text>
+  <rect class="box model" x="210" y="242" width="170" height="70" rx="10"/>
+  <text class="t" x="295" y="266" text-anchor="middle">Chunked prefill</text>
+  <text class="s" x="295" y="283" text-anchor="middle">KV cache + attention</text>
+  <text class="s" x="295" y="298" text-anchor="middle">scores (sum, question window)</text>
+  <rect class="box credit" x="412" y="242" width="170" height="70" rx="10"/>
+  <text class="t" x="497" y="266" text-anchor="middle">kvtc transform</text>
+  <text class="s" x="497" y="283" text-anchor="middle">undo RoPE, project on basis,</text>
+  <text class="s" x="497" y="298" text-anchor="middle">8-bit codes per group of 64</text>
+  <rect class="box ours" x="640" y="232" width="296" height="90" rx="10"/>
+  <text class="t" x="788" y="258" text-anchor="middle">DimmerKV allocator</text>
+  <text class="s" x="788" y="276" text-anchor="middle">error of every token at every precision step</text>
+  <text class="s" x="788" y="292" text-anchor="middle">× importance (flat, or question window)</text>
+  <text class="s" x="788" y="308" text-anchor="middle">greedy upgrades by error removed per byte, under budget</text>
+  <path class="edge" d="M178 277 H208" marker-end="url(#arrow)"/>
+  <path class="edge" d="M380 277 H410" marker-end="url(#arrow)"/>
+  <path class="edge" d="M582 277 H638" marker-end="url(#arrow)"/>
+  <path class="edge dash" d="M679 140 V160 Q679 170 640 170 H520 Q497 170 497 190 V240" marker-end="url(#arrow)"/>
+  <text class="lbl" x="560" y="164">basis</text>
+  <path class="edge dash" d="M861 140 V230" marker-end="url(#arrow)"/>
+  <text class="lbl" x="868" y="200">plane order</text>
+  <path class="edge dash" d="M330 312 V330 Q330 340 350 340 H660 Q680 340 680 330 V324" marker-end="url(#arrow)"/>
+  <text class="lbl" x="372" y="356">importance scores (only used when the question is known)</text>
+
+  <rect class="box ours" x="640" y="372" width="296" height="104" rx="10"/>
+  <text class="t" x="788" y="398" text-anchor="middle">Per-token precision map</text>
+  <text class="s" x="788" y="416" text-anchor="middle">dropped (0 B) · coarse … fine bit-planes</text>
+  <text class="s" x="788" y="432" text-anchor="middle">first 4 + last 32 tokens exact FP16</text>
+  <text class="s" x="788" y="448" text-anchor="middle">≈1.5–5% of the FP16 cache in total</text>
+  <rect class="box" x="352" y="372" width="250" height="104" rx="10"/>
+  <text class="t" x="477" y="398" text-anchor="middle">Bit-pack + DEFLATE</text>
+  <text class="s" x="477" y="416" text-anchor="middle">codes, FP16 offset/scale per group,</text>
+  <text class="s" x="477" y="432" text-anchor="middle">1-byte level id per token</text>
+  <text class="s" x="477" y="448" text-anchor="middle">stored size = counted + 0.1%</text>
+  <rect class="box ours" x="28" y="362" width="290" height="124" rx="10"/>
+  <text class="t" x="173" y="386" text-anchor="middle">Storage tiers</text>
+  <text class="s" x="173" y="406" text-anchor="middle">hot (RAM / GPU): first planes of every token</text>
+  <text class="s" x="173" y="422" text-anchor="middle">cold (CPU / SSD): remaining planes</text>
+  <text class="s" x="173" y="442" text-anchor="middle">memory pressure → drop planes,</text>
+  <text class="s" x="173" y="458" text-anchor="middle">no re-encode</text>
+  <path class="edge" d="M788 322 V370" marker-end="url(#arrow)"/>
+  <path class="edge" d="M640 424 H604" marker-end="url(#arrow)"/>
+  <path class="edge" d="M352 424 H320" marker-end="url(#arrow)"/>
+
+  <!-- Band 3: answer -->
+  <rect class="band" x="10" y="530" width="940" height="300" rx="14"/>
+  <text class="band-title" x="452" y="556">3 · Once per question: restore, refine, answer</text>
+  <text class="band-sub" x="452" y="574">decode_bytes / ProgressiveCache.hot + refine → generate</text>
+  <rect class="box" x="28" y="594" width="150" height="70" rx="10"/>
+  <text class="t" x="103" y="622" text-anchor="middle">Question</text>
+  <text class="s" x="103" y="640" text-anchor="middle">arrives later</text>
+  <rect class="box ours" x="210" y="584" width="210" height="90" rx="10"/>
+  <text class="t" x="315" y="608" text-anchor="middle">Restore hot tier</text>
+  <text class="s" x="315" y="626" text-anchor="middle">inflate, decode only PCA groups</text>
+  <text class="s" x="315" y="642" text-anchor="middle">that carry bits, re-apply RoPE</text>
+  <text class="s" x="315" y="660" text-anchor="middle">~0.1 s (8K) · ~0.4–0.6 s (16K, 3B)</text>
+  <rect class="box ours" x="452" y="584" width="230" height="90" rx="10"/>
+  <text class="t" x="567" y="608" text-anchor="middle">Score with the question</text>
+  <text class="s" x="567" y="626" text-anchor="middle">question's attention over the</text>
+  <text class="s" x="567" y="642" text-anchor="middle">restored cache → top ~1% tokens</text>
+  <text class="s" x="567" y="660" text-anchor="middle">(Loki-style: score, then fetch)</text>
+  <rect class="box ours" x="714" y="584" width="222" height="90" rx="10"/>
+  <text class="t" x="825" y="608" text-anchor="middle">Fetch cold planes</text>
+  <text class="s" x="825" y="626" text-anchor="middle">for those tokens only</text>
+  <text class="s" x="825" y="642" text-anchor="middle">(~0.5% of FP16 extra),</text>
+  <text class="s" x="825" y="660" text-anchor="middle">rebuild just their K/V</text>
+  <rect class="box model" x="452" y="716" width="484" height="90" rx="10"/>
+  <text class="t" x="694" y="742" text-anchor="middle">Llama answers</text>
+  <text class="s" x="694" y="760" text-anchor="middle">normal FP16 attention over the rebuilt cache</text>
+  <text class="s" x="694" y="776" text-anchor="middle">(dropped tokens masked per layer and head)</text>
+  <text class="s" x="694" y="792" text-anchor="middle">same tokens/s as the uncompressed model</text>
+  <rect class="box" x="28" y="716" width="392" height="90" rx="10"/>
+  <text class="t" x="224" y="742" text-anchor="middle">Baselines on the same path</text>
+  <text class="s" x="224" y="760" text-anchor="middle">full cache in RAM · recompute from text (chunked SDPA)</text>
+  <text class="s" x="224" y="776" text-anchor="middle">H2O / SnapKV eviction · kvtc (same precision for all)</text>
+  <text class="s" x="224" y="792" text-anchor="middle">Lexico / PCA (ablations)</text>
+  <path class="edge" d="M178 629 H208" marker-end="url(#arrow)"/>
+  <path class="edge" d="M420 629 H450" marker-end="url(#arrow)"/>
+  <path class="edge" d="M682 629 H712" marker-end="url(#arrow)"/>
+  <path class="edge" d="M825 674 V714" marker-end="url(#arrow)"/>
+  <path class="edge dash" d="M250 486 V582" marker-end="url(#arrow)"/>
+  <text class="lbl" x="258" y="552">hot tier</text>
+  <path class="edge dash" d="M300 486 V510 Q300 520 315 520 H905 Q920 520 920 535 V582" marker-end="url(#arrow)"/>
+  <text class="lbl" x="700" y="514">cold planes (only when refining)</text>
+  <path class="edge dash" d="M315 674 V695 Q315 705 335 705 H600 Q620 705 620 714" marker-end="url(#arrow)"/>
+  <text class="lbl" x="345" y="698">question already in the prompt: answer directly</text>
+
+  <!-- Band 4: evaluation -->
+  <rect class="band" x="10" y="850" width="940" height="150" rx="14"/>
+  <text class="band-title" x="28" y="876">4 · Evaluation and demo</text>
+  <text class="band-sub" x="28" y="894">every script calls the same methods.py, so all numbers are comparable</text>
+  <rect class="box" x="28" y="910" width="170" height="70" rx="10"/>
+  <text class="t" x="113" y="936" text-anchor="middle">Needle test</text>
+  <text class="s" x="113" y="954" text-anchor="middle">question after / in prompt</text>
+  <rect class="box" x="214" y="910" width="150" height="70" rx="10"/>
+  <text class="t" x="289" y="936" text-anchor="middle">Perplexity</text>
+  <text class="s" x="289" y="954" text-anchor="middle">continuation NLL</text>
+  <rect class="box" x="380" y="910" width="180" height="70" rx="10"/>
+  <text class="t" x="470" y="936" text-anchor="middle">Serving benchmark</text>
+  <text class="s" x="470" y="954" text-anchor="middle">MB · conversations/GiB · TTFT</text>
+  <rect class="box" x="576" y="910" width="170" height="70" rx="10"/>
+  <text class="t" x="661" y="936" text-anchor="middle">Grid runner</text>
+  <text class="s" x="661" y="954" text-anchor="middle">all methods → CSV</text>
+  <rect class="box ours" x="762" y="910" width="174" height="70" rx="10"/>
+  <text class="t" x="849" y="936" text-anchor="middle">Gradio demo</text>
+  <text class="s" x="849" y="954" text-anchor="middle">side by side + heat map</text>
+</svg>
+</div>
+<div class="legend">
+  <span class="l-ours">DimmerKV (ours)</span>
+  <span class="l-credit">kvtc transform (credited)</span>
+  <span class="l-model">the LLM itself</span>
+  <span class="l-plain">data, storage, harness</span>
+</div>
+</section>
+
+<section id="results">
+<h2>Results</h2>
+<p>Llama-3.2-1B on an RTX 5060 laptop; Llama-3.2-3B on an AWS L40S. "ans p" is the model's average probability of the correct answer (1.0 = certain). Budgets are the share of the FP16 cache.</p>
+
+<h3>Question known before compression (8K-token documents)</h3>
+<div class="table-wrap"><table>
+  <thead><tr><th>method</th><th class="num">1B, 1.5%</th><th class="num">1B, 2%</th><th class="num">3B, 2%</th></tr></thead>
+  <tbody>
+    <tr><td>Full cache (100%)</td><td class="num">21/24</td><td class="num">21/24</td><td class="num">36/36 · .992</td></tr>
+    <tr><td>SnapKV (evict by question attention)</td><td class="num bad">6/24</td><td class="num bad">10/24</td><td class="num">34/36 · .913</td></tr>
+    <tr><td>kvtc (same precision for all)</td><td class="num">—</td><td class="num">17/24</td><td class="num">35/36 · .978</td></tr>
+    <tr class="hl"><td>DimmerKV, question scores (+ eviction on 1B)</td><td class="num">21/24</td><td class="num">22/24</td><td class="num">36/36 · .986</td></tr>
+    <tr class="hl"><td>DimmerKV progressive + refinement</td><td class="num">—</td><td class="num">—</td><td class="num">36/36 · .992</td></tr>
+  </tbody>
+</table></div>
+
+<h3>Question asked after compression (8K-token documents)</h3>
+<div class="table-wrap"><table>
+  <thead><tr><th>method</th><th class="num">1B, 2%</th><th class="num">3B, 2%</th></tr></thead>
+  <tbody>
+    <tr><td>Full cache</td><td class="num">21/24 · .75</td><td class="num">36/36 · .99</td></tr>
+    <tr><td>H2O</td><td class="num bad">0/24 · .00</td><td class="num bad">0/36 · .00</td></tr>
+    <tr><td>kvtc</td><td class="num">17/24 · .51</td><td class="num">36/36 · .99</td></tr>
+    <tr class="hl"><td>DimmerKV progressive, refine top 1% (+0.5% fetched)</td><td class="num">19/24 · .71</td><td class="num">36/36 · .99</td></tr>
+  </tbody>
+</table></div>
+
+<h3>Serving: 3B, 16K-token conversations, 18 questions</h3>
+<div class="table-wrap"><table>
+  <thead><tr><th>how the conversation is kept</th><th class="num">stored</th><th class="num">in 8 GiB RAM</th><th class="num">first token</th><th class="num">correct</th></tr></thead>
+  <tbody>
+    <tr><td>Full cache in RAM</td><td class="num">1,753 MiB</td><td class="num">4</td><td class="num">189 ms</td><td class="num">18/18</td></tr>
+    <tr><td>Recompute from text</td><td class="num">~0</td><td class="num">unlimited</td><td class="num">1,434 ms</td><td class="num">18/18</td></tr>
+    <tr><td>H2O, 2%</td><td class="num">35 MiB</td><td class="num">230</td><td class="num">61 ms</td><td class="num bad">0/18</td></tr>
+    <tr class="hl"><td>kvtc / DimmerKV, 2%</td><td class="num">31 MiB</td><td class="num">263 (57×)</td><td class="num">488–627 ms</td><td class="num good">18/18</td></tr>
+  </tbody>
+</table></div>
+
+<h3>Perplexity: 3B, 8K tokens (full cache 8.33, lower is better)</h3>
+<div class="table-wrap"><table>
+  <thead><tr><th>method</th><th class="num">2%</th><th class="num">3%</th><th class="num">5%</th></tr></thead>
+  <tbody>
+    <tr><td>H2O</td><td class="num">10.64</td><td class="num">10.41</td><td class="num">10.11</td></tr>
+    <tr><td>SnapKV</td><td class="num">10.25</td><td class="num">9.92</td><td class="num">9.51</td></tr>
+    <tr><td>kvtc</td><td class="num">8.48</td><td class="num">8.42</td><td class="num">8.34</td></tr>
+    <tr class="hl"><td>DimmerKV, question scores</td><td class="num">8.46</td><td class="num">8.37</td><td class="num">8.35</td></tr>
+  </tbody>
+</table></div>
+</section>
+
+<section id="limits">
+<h2>Limits, stated plainly</h2>
+<ul class="tight">
+  <li><strong>Savings are in storage and transfer</strong> (RAM, disk, network). After restore the model works on a normal FP16 cache, so GPU memory and generation speed during answering are unchanged.</li>
+  <li><strong>Without the question, per-token precision alone is only slightly better than kvtc</strong> (often tied at 8K tokens); the gains come from question scores and question-time refinement.</li>
+  <li><strong>The 3B model is near the ceiling</strong> on our needle test at 2%, so methods are hard to separate there; harder tasks and an 8B run are next.</li>
+  <li><strong>Our kvtc is simplified</strong>: greedy bit allocation instead of the paper's dynamic program, fixed groups of 64, zlib on the CPU. Numbers are ours, not a reproduction.</li>
+  <li><strong>Small samples:</strong> 18–36 questions per setting; differences of 1–2 answers are noise.</li>
+</ul>
+</section>
+
+<section id="credits">
+<h2>Credits</h2>
+<ul class="tight">
+  <li><span class="tag credit">kvtc</span>Staniszewski &amp; Łańcucki, "KV Cache Transform Coding for Compact Storage in LLM Inference", ICLR 2026: cross-layer PCA, RoPE removal, grouped quantization.</li>
+  <li><span class="tag credit">H2O</span>Zhang et al., NeurIPS 2023: heavy-hitter eviction; our baseline and the idea behind attention scores.</li>
+  <li><span class="tag credit">SnapKV</span>question-window attention scores, used for eviction (baseline) and for weighting precision (ours).</li>
+  <li><span class="tag credit">Lexico</span>sparse dictionary coding of KV vectors; our first codec and an ablation.</li>
+  <li><span class="tag credit">Loki, Mooncake</span>score-then-fetch and tiered KV storage, which shaped question-time refinement and the hot/cold tiers.</li>
+</ul>
+<p>Team Deadoop: Srikanth Balaaji, Sushanth B, T S Sathya Kiran. Code and detailed numbers: <code>FINDINGS.md</code> and <code>results/</code> in the repository (branch <code>codec-rework</code>).</p>
+</section>
+
+<footer>DimmerKV · Hashcode 14.0, PES University · built 24–25 Oct 2026.</footer>
+</main>
+<script>
+  (function () {
+    var root = document.documentElement;
+    var button = document.getElementById("themeToggle");
+    var stored = null;
+    try { stored = localStorage.getItem("dimmerkv-theme"); } catch (e) {}
+    if (stored === "light" || stored === "dark") root.setAttribute("data-theme", stored);
+    button.addEventListener("click", function () {
+      var dark = root.getAttribute("data-theme") === "dark" ||
+        (!root.getAttribute("data-theme") && window.matchMedia("(prefers-color-scheme: dark)").matches);
+      var next = dark ? "light" : "dark";
+      root.setAttribute("data-theme", next);
+      try { localStorage.setItem("dimmerkv-theme", next); } catch (e) {}
+    });
+  })();
+</script>
+</body>
+</html>
