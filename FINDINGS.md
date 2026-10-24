@@ -1,9 +1,56 @@
 # DimmerKV — experimental findings so far
 
-Status as of Sun 25 Oct 2026, ~3:30 AM IST. Model: Llama-3.2-1B-Instruct (FP16,
+Status as of Sun 25 Oct 2026, ~3:45 AM IST. Model: Llama-3.2-1B-Instruct (FP16,
 16 layers, 8 KV heads, head dim 64) on the LOQ laptop (RTX 5060 8 GB).
 Branch: `codec-rework`. Raw numbers and the run-by-run log are in `CLAUDE.md`;
 logs in `logs/` (not committed); grid results as CSV in `results/`.
+
+## Recap of all testing (Sat 24 Oct 3 PM → Sun 25 Oct 3:30 AM)
+
+All runs: Llama-3.2-1B-Instruct, RTX 5060 laptop (8 GB). Main test: hidden
+4-digit facts ("needles") in WikiText; the cache is compressed, then each
+question is asked; plus perplexity, timing, and real storage size.
+"X%" = compressed cache size as a share of the normal FP16 cache
+(3% ≈ 33× smaller). Details per step are in sections 1–10 below.
+
+| # | what we tested | result |
+|---|---|---|
+| 1 | Per-head PCA codec (INT8) vs Lexico (sparse dictionary) | Lexico far more accurate per byte; PCA useless below ~40% |
+| 2 | Uniform codes, and PCA/Lexico mixes for keys vs values | Keys are the fragile stream; Lexico on both is best |
+| 3 | DimmerKV allocator on Lexico with H2O scores | H2O scores rank the facts *below average* before the question → 0/18 |
+| 4 | Allocator ignoring scores ("flat", bytes by error per byte) | Doubles uniform Lexico at equal bytes (10 vs 5/18 at 15%) |
+| 5 | H2O as importance without eviction; question in the prompt | Still fails after compression; with the question visible, question-window scores (SnapKV-style) + graded precision win (17/18 at 15%) |
+| 6 | Faster OMP (Lexico encoder) | 2× faster, identical results |
+| 7 | kvtc-style transform coding (cross-layer PCA, RoPE removed, 0/2/4/8-bit groups) | ~25× compression with near-full accuracy; far better than everything before |
+| 8 | DimmerKV on top of kvtc (per-token precision), full grid of 9 methods × budgets × 2 modes × perplexity | DimmerKV beats kvtc at equal bytes; biggest gain with question scores |
+| 9 | Real storage (bit-packed + DEFLATE) and restore | Restored cache identical; 37× smaller at 3% on 3K tokens |
+| 10 | Serving benchmark in MB / ms / tokens/s (3K and 8K tokens) | 23–37× more conversations per GiB of RAM, ~3–5× faster first token than recomputing, same generation speed |
+| — | 16K-token serving run | Stopped (pinned-memory limit on Windows, rerun not finished) |
+
+**Headline comparison** (8K-token conversations, 24 questions):
+
+| method | size | conversations in 8 GiB RAM | first token | needles, question later | needles, question in prompt (3%) |
+|---|---|---|---|---|---|
+| full cache in RAM | 252 MiB | 32 | 47 ms | 21/24 | 21/24 |
+| recompute from text | ~0 | unlimited | 1,384 ms | 21/24 | 21/24 |
+| H2O 2–5% | 5–13 MiB | 643–1,586 | 35 ms | 0/24 | — |
+| SnapKV 3% | — | — | — | — | 13/24 |
+| kvtc 5% | 11.2 MiB | 732 | 471 ms | 21/24 | 21/24 (.60) |
+| **DimmerKV-kvtc 5%** | 11.2 MiB | 732 | 478 ms | **21/24** | **22/24 (.76) with question scores** |
+
+**Bottom line**
+- Eviction (H2O, SnapKV) loses facts asked about after compression; this is
+  the core failure DimmerKV addresses.
+- kvtc-style transform coding is the right codec (credited to Staniszewski &
+  Łańcucki, ICLR 2026); Lexico and PCA remain as ablations.
+- DimmerKV's per-token precision on kvtc adds a consistent gain at short
+  contexts and a clear gain when the question is visible (matches the full
+  cache at 3% on 8K tokens); without the question it ties kvtc at 8K.
+- Savings are in storage and transfer (RAM, disk, network); GPU memory and
+  generation speed during answering are unchanged (Level 1).
+
+**Open items**: 16K-token run, bigger models (3B/8B on AWS), eviction as a
+precision rung, refine-on-demand for questions asked after compression.
 
 ## TL;DR
 
@@ -563,7 +610,8 @@ What it shows:
 - **Question not visible**: at 8K tokens flat per-token rungs are tied with
   kvtc (the +.02–.05 gain at 1.6–3K tokens does not carry over).
 - 16K-token run: first attempt ran out of pinned host memory (Windows limit)
-  after the accuracy pass; rerunning with pageable RAM fallback.
+  after the accuracy pass; a rerun with a pageable-RAM fallback was stopped
+  before finishing, so there are no 16K results.
 
 ## Caveats
 
