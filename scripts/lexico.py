@@ -133,11 +133,23 @@ class LexicoCodec:
     ) -> tuple[list[torch.Tensor], list[torch.Tensor], int]:
         """Uniform Lexico: every middle token gets ``sparsity`` atoms."""
         if len(keys) != self.layers or len(values) != self.layers:
-            raise ValueError("The cache layer count does not match the dictionaries.")
+            raise ValueError("The cache layer count does not match the codec.")
+        new_keys, key_bytes = self.compress_stream(keys, "key", sparsity, exact_prefix, exact_recent)
+        new_values, value_bytes = self.compress_stream(values, "value", sparsity, exact_prefix, exact_recent)
+        return new_keys, new_values, key_bytes + value_bytes
+
+    def compress_stream(
+        self,
+        tensors: list[torch.Tensor],
+        kind: str,
+        sparsity: int,
+        exact_prefix: int | None = None,
+        exact_recent: int = 0,
+    ) -> tuple[list[torch.Tensor], int]:
+        """Compress one stream (K or V); returns rebuilt tensors and bytes."""
         return uniform_compress(
-            keys,
-            values,
-            lambda tensor, layer, kind: self.round_trip(tensor, layer, kind, sparsity),
+            tensors,
+            lambda tensor, layer: self.round_trip(tensor, layer, kind, sparsity),
             bytes_per_vector(sparsity),
             self.skip_prefix if exact_prefix is None else exact_prefix,
             exact_recent,

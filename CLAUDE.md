@@ -266,3 +266,40 @@ Compress time for the whole context: PCA ~10 ms, Lexico 0.6-1.4 s
 but encode is ~40-60x slower than PCA; decode cost is the same.
 Per-question generate times are not comparable yet (first call includes
 warm-up; wrong answers stop early).
+
+## Progress log (2026-10-24, ~6:15 PM IST): K/V codec mix + better needle metrics
+
+`test_generation.py` now takes `--configs` specs (`pca16`, `lex8`,
+`pca16/lex8` = key/value) and `--seeds` (default 3 contexts x 6 needles = 18).
+Metrics: **correct** (expected number appears in the greedy reply, first 12
+tokens), **agree** (reply identical to full-cache reply), **answer NLL**
+(teacher-forced mean NLL per answer token; `ans p` = exp(-NLL), smooth so
+it separates configs with equal accuracy), compress ms per context
+(encode + decode, CUDA-synced), generate ms per new token.
+`compress_stream` on both codecs compresses one stream at a time.
+
+Results (Llama-3.2-1B, ~1.6K-token contexts, uniform codes, no recent window;
+logs/needle_kv_mix*.log):
+
+| budget | config (K/V) | correct | ans p | compress ms |
+|---|---|---|---|---|
+| ~14% | pca16 | 0/18 | 0.001 | 27 |
+| | lex5 | 3/18 | 0.024 | 671 |
+| | pca16/lex5 | 0/18 | 0.001 | 293 |
+| | lex8/pca8 | 0/18 | 0.002 | 493 |
+| ~20% | lex8 | **10/18** | **0.267** | 948 |
+| | pca24/lex8 | 1/18 | 0.004 | 484 |
+| | lex8/pca24 | 4/18 | 0.053 | 476 |
+| | lex11/pca16 | 3/18 | 0.039 | 689 |
+| ~27% | pca32 | 1/18 | 0.023 | 13 |
+| | lex11 | **16/18** | **0.789** | 1372 |
+| | pca32/lex11 | 9/18 | 0.105 | 698 |
+| | lex11/pca32 | 10/18 | 0.248 | 697 |
+| | pca16/lex16 | 0/18 | 0.000 | 1100 |
+
+Conclusions: Lexico for both streams wins at every budget. Mixing halves
+compress time but costs far more quality than it saves; keys are the more
+sensitive stream (PCA keys + rich Lexico values collapses to 0/18), but PCA
+values also hurt. Generate time per token is identical across configs because
+Level 1 rebuilds a full FP16 cache; codes only change memory, not decode
+speed. Encode speed is the cost to attack (OMP), not the codec choice.

@@ -162,11 +162,24 @@ class PCACodec:
         exact FP16. Returns reconstructed tensors and the counted bytes.
         """
         if len(keys) != self.layers or len(values) != self.layers:
-            raise ValueError("The cache layer count does not match the PCA basis.")
+            raise ValueError("The cache layer count does not match the codec.")
+        new_keys, key_bytes = self.compress_stream(keys, "key", components, bits, exact_prefix, exact_recent)
+        new_values, value_bytes = self.compress_stream(values, "value", components, bits, exact_prefix, exact_recent)
+        return new_keys, new_values, key_bytes + value_bytes
+
+    def compress_stream(
+        self,
+        tensors: list[torch.Tensor],
+        kind: str,
+        components: int,
+        bits: int,
+        exact_prefix: int | None = None,
+        exact_recent: int = 0,
+    ) -> tuple[list[torch.Tensor], int]:
+        """Compress one stream (K or V); returns rebuilt tensors and bytes."""
         return uniform_compress(
-            keys,
-            values,
-            lambda tensor, layer, kind: self.round_trip(tensor, layer, kind, components, bits),
+            tensors,
+            lambda tensor, layer: self.round_trip(tensor, layer, kind, components, bits),
             bytes_per_vector(components, bits),
             self.skip_prefix if exact_prefix is None else exact_prefix,
             exact_recent,

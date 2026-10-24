@@ -138,36 +138,31 @@ def collect_vectors(
     )
 
 
+
 def uniform_compress(
-    keys: list[torch.Tensor],
-    values: list[torch.Tensor],
+    tensors: list[torch.Tensor],
     round_trip,
     vector_bytes: int,
     exact_prefix: int,
     exact_recent: int,
-) -> tuple[list[torch.Tensor], list[torch.Tensor], int]:
-    """Give every middle token the same code; keep sink and recent tokens exact.
+) -> tuple[list[torch.Tensor], int]:
+    """Give every middle token of one stream (K or V) the same code.
 
-    ``round_trip(tensor, layer, kind)`` encodes and decodes
-    [batch, kv_heads, tokens, head_dim]. Returns rebuilt tensors and the
-    counted bytes (codes for middle tokens, FP16 for exact tokens).
+    ``tensors`` are per-layer [batch, kv_heads, tokens, head_dim];
+    ``round_trip(tensor, layer)`` encodes and decodes one layer's slice. Sink
+    and recent tokens stay exact. Returns rebuilt tensors and counted bytes
+    (codes for middle tokens, FP16 for exact tokens).
     """
-    tokens = keys[0].shape[-2]
+    batch, heads, tokens, head_dim = tensors[0].shape
     start = min(exact_prefix, tokens)
     end = max(start, tokens - exact_recent)
-    head_dim = keys[0].shape[-1]
-
-    def compress(tensors: list[torch.Tensor], kind: str) -> list[torch.Tensor]:
-        out = []
-        for layer, tensor in enumerate(tensors):
-            rebuilt = tensor.clone()
-            if end > start:
-                rebuilt[..., start:end, :] = round_trip(tensor[..., start:end, :], layer, kind)
-            out.append(rebuilt)
-        return out
-
-    heads = keys[0].shape[0] * keys[0].shape[-3]
-    per_stream = len(keys) * heads * (
+    rebuilt = []
+    for layer, tensor in enumerate(tensors):
+        out = tensor.clone()
+        if end > start:
+            out[..., start:end, :] = round_trip(tensor[..., start:end, :], layer)
+        rebuilt.append(out)
+    used = len(tensors) * batch * heads * (
         (end - start) * vector_bytes + (tokens - (end - start)) * head_dim * 2
     )
-    return compress(keys, "key"), compress(values, "value"), 2 * per_stream
+    return rebuilt, used
