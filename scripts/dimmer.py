@@ -28,6 +28,8 @@ class _State:
     scores: dict[int, torch.Tensor] = field(default_factory=dict)
     window_scores: dict[int, torch.Tensor] = field(default_factory=dict)
     evicted: dict[int, torch.Tensor] = field(default_factory=dict)
+    # compressed_attention.CompressedContext: attend over codes instead of a full cache.
+    compressed: object = None
 
 
 STATE = _State()
@@ -42,6 +44,8 @@ def _repeat_kv(tensor: torch.Tensor, groups: int) -> torch.Tensor:
 
 def dimmer_attention(module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs):
     """Eager attention plus H2O score recording and per-head eviction masks."""
+    if STATE.compressed is not None:
+        return STATE.compressed.attend(module, query, key, value, attention_mask, scaling)
     groups = module.num_key_value_groups
     key_states = _repeat_kv(key, groups)
     value_states = _repeat_kv(value, groups)

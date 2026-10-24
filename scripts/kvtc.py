@@ -224,6 +224,7 @@ class KVTCCodec:
                         choice[kind][picked] = rung + 1
 
         self.last_choice = choice  # Per-token rungs, for kvtc_storage.encode_bytes.
+        self.last_coefficients, self.last_span = {}, (start, end)
         hidden = torch.zeros(tokens, dtype=torch.bool, device=self.device)
         hidden[start:end] = choice["key"] < 0
         self.last_evicted = [hidden[None].expand(self.heads, -1) for _ in range(self.layers)] if evict else None
@@ -247,6 +248,7 @@ class KVTCCodec:
                 share = float(rows.float().mean()) / 2
                 name = "exact" if rung == exact_rung else f"{level_bytes[kind][rung] / self.exact_bytes:.3f}"
                 histogram[name] = histogram.get(name, 0.0) + share
+            self.last_coefficients[kind] = decoded  # Dequantized codes, for compressed_attention.
             matrix[start:end] = inverse_transform(decoded, stream, self.group)
             rebuilt[kind] = self.from_matrix(matrix, kind, cos, sin, tensors[0].dtype)
             # Exact tokens keep their original (bit-identical) values.
