@@ -46,9 +46,9 @@ def quantize8(coefficients: torch.Tensor, group: int):
 
 def dequantize(codes: torch.Tensor, low: torch.Tensor, span: torch.Tensor, planes: torch.Tensor) -> torch.Tensor:
     """Decode with ``planes`` [tokens or 1, groups] top bit-planes per group (0 = dropped -> 0)."""
-    m = planes.long()[..., None]
+    m = planes.to(torch.int32)[..., None]
     shift = (PLANES - m).clamp(0, PLANES)
-    index = codes.long() >> shift
+    index = codes.to(torch.int32) >> shift
     bins = (2**m).float()
     value = low.float()[..., None] + (index.float() + 0.5) * span.float()[..., None] / bins
     out = torch.where(m > 0, value, torch.zeros_like(value))
@@ -148,10 +148,17 @@ class ProgressiveCodec:
             coefficients = (matrix[start:end] - stream.mean) @ stream.basis
             codes, low, span = quantize8(coefficients, base.group)
             energy = coefficients.square().sum(dim=1).mean().clamp_min(1e-12)
-            rung_error = torch.stack([
-                (coefficients - dequantize(codes, low, span, order.planes[k][None].float())).square().sum(dim=1)
-                for k in order.rungs
-            ], dim=1) / energy
+            # Error of every (token, group) at 0..8 planes, then each rung's error by lookup.
+            grouped = coefficients.view(middle, -1, base.group)
+            groups = grouped.shape[1]
+            table = torch.stack([
+                (grouped - dequantize(codes, low, span, torch.full((1, groups), m, device=self.device))
+                 .view_as(grouped)).square().sum(dim=-1)
+                for m in range(PLANES + 1)
+            ], dim=-1)  # [tokens, groups, 9]
+            rung_planes = order.planes[order.rungs].long().T  # [groups, rungs]
+            rung_error = table.gather(2, rung_planes[None].expand(middle, -1, -1)).sum(dim=1) / energy
+            del table, grouped
             if weights is not None:
                 importance = weights[start:end].float()
                 rung_error = rung_error * (importance / importance.mean().clamp_min(1e-12))[:, None]
