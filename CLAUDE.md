@@ -826,3 +826,12 @@ GPU memory held per conversation 253 MB -> 18-31 MB at 2%; ~0.9x speed at 2%,
   kvtc 0.82 (full 0.96). Key-value retrieval: kvtc 0.65-0.70 at 5% beats
   DimmerKV 0.35-0.55 (dense, equally important tokens). Eviction collapses on
   both. FINDINGS.md section 14; results/ruler_*.txt.
+
+## Progress log (2026-10-25, ~4:10 AM IST): precision floor, demo backup, review deck
+
+- `dkvtc@b:snap:floor1` (kvtc's uniform rung for every token, leftover by
+  question score) ties kvtc on key-value retrieval (0.65 vs 0.70/0.65) and keeps
+  the variable-tracking lead (0.90-0.91 vs 0.81-0.82). Partial floors and key
+  weighting did not help. FINDINGS.md section 15.
+- `docs/demo_backup.html` from `scripts/demo_backup.py` (recorded demo scenarios).
+- Review 2 deck: https://claude.ai/artifact/BefpqPTgntqBAiG4ax3cm7 (private).

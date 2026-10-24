@@ -471,9 +471,10 @@
     <tr><td>kvtc</td><td class="num">0.82</td><td class="num">0.82</td><td class="num good">0.70</td></tr>
     <tr class="hl"><td>DimmerKV + question scores + eviction</td><td class="num">0.92</td><td class="num">0.84</td><td class="num">0.40</td></tr>
     <tr class="hl"><td>DimmerKV progressive + refine top 1%</td><td class="num">0.87</td><td class="num">0.87</td><td class="num">0.55</td></tr>
+    <tr class="hl"><td>DimmerKV + question scores + floor at kvtc’s level</td><td class="num">0.91</td><td class="num">0.90</td><td class="num">0.65</td></tr>
   </tbody>
 </table></div>
-<p>DimmerKV wins where importance is uneven (multi-hop chains hidden in filler). On a dense table of random UUIDs, where every token matters equally, plain kvtc's uniform precision is better.</p>
+<p>DimmerKV wins where importance is uneven (multi-hop chains hidden in filler). On a dense table of random UUIDs, where every token matters equally, plain per-token allocation lost to kvtc; giving every token kvtc’s precision first and spending only the leftover by question score ties kvtc there and keeps the lead on variable tracking.</p>
 
 <h3>Perplexity: 3B, 8K tokens (full cache 8.33, lower is better)</h3>
 <div class="table-wrap"><table>
@@ -494,7 +495,7 @@
   <li><strong>Without the question, per-token precision alone is only slightly better than kvtc</strong> (often tied at 8K tokens); the gains come from question scores and question-time refinement.</li>
   <li><strong>The 3B model is near the ceiling</strong> on our needle test at 2%, so methods are hard to separate there; harder tasks and an 8B run are next.</li>
   <li><strong>Our kvtc is simplified</strong>: greedy bit allocation instead of the paper's dynamic program, fixed groups of 64, zlib on the CPU. Numbers are ours, not a reproduction.</li>
-  <li><strong>Per-token precision can lose to uniform kvtc</strong> when every token matters equally: on key-value retrieval of random UUIDs kvtc scores 0.65–0.70 at 5% vs 0.35–0.55 for DimmerKV.</li>
+  <li><strong>Per-token precision can lose to uniform kvtc</strong> when every token matters equally: on key-value retrieval of random UUIDs kvtc scores 0.65–0.70 at 5% vs 0.35–0.55 for DimmerKV. A floor at kvtc’s precision plus question scores ties kvtc (0.65); the flat variant does not.</li>
   <li><strong>Small samples:</strong> 18–36 questions per setting; differences of 1–2 answers are noise.</li>
 </ul>
 </section>

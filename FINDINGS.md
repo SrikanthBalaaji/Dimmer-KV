@@ -1,11 +1,11 @@
 # DimmerKV — experimental findings so far
 
-Status as of Sun 25 Oct 2026, ~3:40 AM IST. Model: Llama-3.2-1B-Instruct (FP16,
+Status as of Sun 25 Oct 2026, ~4:10 AM IST. Model: Llama-3.2-1B-Instruct (FP16,
 16 layers, 8 KV heads, head dim 64) on the LOQ laptop (RTX 5060 8 GB).
 Branch: `codec-rework`. Raw numbers and the run-by-run log are in `CLAUDE.md`;
 logs in `logs/` (not committed); grid results as CSV in `results/`.
 
-## Recap of all testing (Sat 24 Oct 3 PM → Sun 25 Oct 3:40 AM)
+## Recap of all testing (Sat 24 Oct 3 PM → Sun 25 Oct 4:10 AM)
 
 Runs on Llama-3.2-1B-Instruct, RTX 5060 laptop (8 GB), unless marked
 3B (Llama-3.2-3B-Instruct on an AWS L40S). Main test: hidden
@@ -33,6 +33,7 @@ question is asked; plus perplexity, timing, and real storage size.
 | 15 | 3B serving at 16K on AWS | 57× more conversations per GiB, 18/18 correct; H2O 0/18 |
 | 16 | Attention directly over the compressed cache (keys per layer, values never decoded) | Same answers 60/60; GPU memory while answering 253 MB → 18–31 MB at 2%, ~0.9× speed |
 | 17 | RULER-style variable tracking (8K) and key-value retrieval (4K) | Variable tracking: DimmerKV question-aware 0.92 vs kvtc 0.82 (full 0.96); key-value: kvtc 0.65–0.70 beats DimmerKV 0.35–0.55; eviction collapses on both |
+| 18 | Precision floor at kvtc's step + question scores | Ties kvtc on key-value retrieval (0.65 vs 0.70/0.65), keeps the variable-tracking lead (0.90–0.91 vs 0.81–0.82) |
 
 **Headline comparison** (8K-token conversations, 24 questions):
 
@@ -847,13 +848,51 @@ Key-value retrieval, 4K tokens (full cache 0.65):
   token matters equally. A minimum precision per token is the obvious fix to
   test next. 20 samples per cell: differences below ~0.1 are within noise.
 
+## 15. Fixing the dense-lookup loss: a precision floor at kvtc's level
+
+Section 14 found DimmerKV losing to kvtc on key-value retrieval. Tried, all
+on the same 20 samples (raw logs `results/ruler_*floor*.txt`, `*_kw.txt`):
+
+| variant (key-value 4K, 5%) | question after | question in prompt |
+|---|---|---|
+| full cache | 0.65 | 0.65 |
+| kvtc (uniform) | 0.70 | 0.65 |
+| DimmerKV, floor at half the budget (`:floor`) | 0.45 | 0.50 |
+| DimmerKV, floor at 80% (`:floor0.8`) | 0.40 | — |
+| DimmerKV, key errors ×4 / ×16 (`:kw4`, `:kw16`) | 0.45 / 0.20 | — |
+| DimmerKV flat, floor at kvtc's own rung (`:floor1`) | 0.40 | 0.60 |
+| **DimmerKV + question scores + floor at kvtc's rung (`:snap:floor1`)** | **0.65** | **0.65** |
+
+Variable tracking 8K, 3% with the same floor:
+
+| variant | question after | question in prompt |
+|---|---|---|
+| full cache | 0.96 | 0.96 |
+| kvtc | 0.81 | 0.82 |
+| DimmerKV + question scores + floor (`:snap:floor1`) | **0.90** | **0.91** |
+
+- Partial floors put every token one precision step below kvtc's uniform
+  step; UUID lookups need every token at least at that step, so they did not
+  help. Weighting key errors did not help either.
+- **A floor at kvtc's own step plus question-scored top-ups is never worse
+  than kvtc on both tasks here**: it ties kvtc on key-value retrieval and
+  keeps the +0.09 lead on variable tracking. This is the recommended safe
+  setting (`dkvtc@b:snap:floor1`).
+- The flat variant with the same floor still scores 0.40 on key-value
+  retrieval (question after); with kvtc above the full cache (0.70 vs 0.65),
+  this task is noisy for the 1B model, so treat ±0.2 there with caution.
+- `scripts/demo_backup.py` writes `docs/demo_backup.html`: the demo's three
+  scenarios and leaderboard recorded from the live model, for use if the
+  live demo cannot run.
+
 ## Caveats
 
 - Mostly one small model (Llama-3.2-1B; 3B on AWS), up to 16K-token contexts,
   synthetic needles and RULER-style tasks (18–36 questions or 20 samples per
   setting), 4–8 perplexity chunks. LongBench and GSM8K not run.
 - Per-token precision can lose to uniform kvtc on dense lookup tasks where every
-  token matters equally (key-value retrieval, section 14).
+  token matters equally (key-value retrieval, section 14); a floor at kvtc's
+  step with question scores closes the gap (section 15), the flat variant does not.
 - The kvtc family is near the ceiling on needle counts at 3–20% memory;
   answer probability carries the comparison. Differences of 1–2 needles are
   noise.

@@ -17,6 +17,7 @@ T S Sathya Kiran.
 
 Full write-up with the architecture diagram: [`docs/DimmerKV_overview.html`](docs/DimmerKV_overview.html)
 (download and open in a browser). Every experiment and number: [`FINDINGS.md`](FINDINGS.md).
+Recorded demo scenarios (if the live demo cannot run): [`docs/demo_backup.html`](docs/demo_backup.html).
 
 ---
 
@@ -140,9 +141,12 @@ rebuilt before answering.
 | kvtc | 0.82 | 0.82 | **0.70** |
 | DimmerKV + question scores + eviction | **0.92** | 0.84 | 0.40 |
 | DimmerKV progressive + refine top 1% | 0.87 | **0.87** | 0.55 |
+| **DimmerKV + question scores + floor at kvtc's level** | 0.91 | **0.90** | **0.65** |
 
-DimmerKV wins where importance is uneven (multi-hop chains in filler); on a dense table of random
-UUIDs, where every token matters equally, plain kvtc's uniform precision is better.
+DimmerKV wins where importance is uneven (multi-hop chains in filler). On a dense table of random
+UUIDs, where every token matters equally, plain per-token allocation lost to kvtc; giving every token
+kvtc's precision first and spending only the leftover by question score (`dkvtc@b:snap:floor1`)
+ties kvtc there while keeping the lead on variable tracking.
 
 **Perplexity: 3B, 8K tokens** (full cache 8.33; lower is better)
 
@@ -214,6 +218,7 @@ the top of [`scripts/methods.py`](scripts/methods.py).
   8K tokens); the clear gains come from question scores and question-time refinement.
 - **Per-token precision can lose to uniform kvtc** when every token matters equally: on RULER-style
   key-value retrieval (random UUIDs) kvtc scores 0.65–0.70 at 5% vs 0.35–0.55 for DimmerKV variants.
+  A floor at kvtc's precision plus question scores ties kvtc (0.65); the flat variant does not.
 - **The 3B model is near the ceiling** of our needle test at 2%, so methods are hard to separate there.
   8B and harder tasks (multi-hop, LongBench) are next.
 - **Our kvtc is simplified**: greedy bit allocation instead of the paper's dynamic program, fixed groups
