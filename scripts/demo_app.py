@@ -61,18 +61,27 @@ def timed(fn):
 
 
 def prefill(context: str, question: str, in_prompt: bool):
-    """Prefill (memoized): context ids, question-tail ids, cache tensors, scores, prefill ms."""
-    key = (context, question if in_prompt else None)
+    """Context ids, question-tail ids, cache tensors, scores, prefill ms.
+
+    The prefilled part is memoized: it is the document alone when the question
+    comes after compression (shared by every question), or document + question
+    when the question is in the prompt. The question tail is always rebuilt
+    for the current question.
+    """
+    splitter = split_ids_in_prompt if in_prompt else split_ids
+    head_ids, tail_ids = splitter(tokenizer, context, question)
+    key = (context, in_prompt, question if in_prompt else None)
     if key not in _prefill_cache:
-        splitter = split_ids_in_prompt if in_prompt else split_ids
-        head_ids, tail_ids = splitter(tokenizer, context, question)
         with torch.inference_mode():
             (cache, scores), ms = timed(lambda: dimmer.prefill_with_scores(model, head_ids[None].to(device)))
         keys = [layer.keys.clone() for layer in cache.layers]
         values = [layer.values.clone() for layer in cache.layers]
         _prefill_cache.clear()
-        _prefill_cache[key] = (head_ids, tail_ids, keys, values, scores, ms)
-    return _prefill_cache[key]
+        _prefill_cache[key] = (head_ids, keys, values, scores, ms)
+    cached_ids, keys, values, scores, ms = _prefill_cache[key]
+    if not torch.equal(cached_ids, head_ids):
+        raise RuntimeError("Prefilled tokens do not match the current prompt.")
+    return head_ids, tail_ids, keys, values, scores, ms
 
 
 def answer_with(keys, values, evicted, context_ids, tail_ids) -> str:
