@@ -48,7 +48,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("results/grid.csv"))
     args = parser.parse_args()
 
-    names = [template.format(b=f"{budget:.2f}") for budget in args.budgets for template in args.templates]
+    names = [template.format(b=f"{budget:g}") for budget in args.budgets for template in args.templates]
     tokenizer, model, device = load_model(args.model)
     dimmer.install(model)
     methods = Methods(args.model, args.basis, args.dictionary, device, args.recent,
