@@ -24,3 +24,6 @@ wandb/
 .DS_Store
 Thumbs.db
 .ipynb_checkpoints/
+
+# Logs
+logs/
