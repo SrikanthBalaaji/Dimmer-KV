@@ -1,6 +1,6 @@
 # DimmerKV — experimental findings so far
 
-Status as of Sat 24 Oct 2026, ~10:30 PM IST. Model: Llama-3.2-1B-Instruct (FP16,
+Status as of Sun 25 Oct 2026, ~0:30 AM IST. Model: Llama-3.2-1B-Instruct (FP16,
 16 layers, 8 KV heads, head dim 64) on the LOQ laptop (RTX 5060 8 GB).
 Branch: `codec-rework`. Raw numbers and the run-by-run log are in `CLAUDE.md`;
 logs in `logs/` (not committed).
@@ -288,6 +288,77 @@ What this shows:
 - Correct counts are saturated (16–18/18) at these budgets; ans p and
   perplexity carry the comparison. Budgets below ~4% are dominated by the 36
   exact tokens in 1.6K contexts, so the tighter regime needs 4K+ contexts.
+
+## 7. Full comparison grid (all methods, both modes, perplexity)
+
+New for this grid: `kvtcf@b` (kvtc with evenly spaced tokens moved one rung
+up so it spends the whole budget; the fair equal-bytes baseline, since plain
+kvtc's coarse rungs leave budget unused) and `dkvtc@b:snap` (DimmerKV on
+kvtc with each token's error weighted by question-window attention). Run with
+`scripts/run_grid.py`; raw rows in `results/grid_1b_ctx1500.csv` and
+`results/grid_1b_ctx3000.csv`. Each cell is correct / answer probability.
+
+**Run A**: ~1.6K-token contexts, 36 needles per mode, 8 perplexity chunks.
+
+Question after compression:
+
+| method | 4% | 7% | 10% | 15% | 20% |
+|---|---|---|---|---|---|
+| Lexico, uniform | 0 / .00* | 0 / .00* | 0 / .00 | 1 / .00 | 16 / .20 |
+| H2O | 1 / .00 | 1 / .00 | 0 / .00 | 0 / .00 | 0 / .00 |
+| SnapKV | 1 / .00 | 2 / .00 | 2 / .00 | 4 / .01 | 6 / .03 |
+| DimmerKV on Lexico, flat | 0 / .00 | 0 / .00 | 1 / .01 | 16 / .23 | 30 / .70 |
+| kvtc | 33 / .77 | 35 / .93 | 35 / .95 | 36 / .97 | 36 / .98 |
+| kvtc, filled | 35 / .79 | 35 / .94 | 34 / .94 | 36 / .97 | 36 / .98 |
+| DimmerKV on kvtc, flat | 36 / .81 | 35 / .97 | 35 / .96 | 36 / .98 | 36 / .98 |
+| DimmerKV on kvtc, question scores | 36 / .86 | 36 / .95 | 36 / .97 | 36 / .98 | 36 / .98 |
+
+\* uniform Lexico cannot go below 1 atom per vector; it uses 5% there.
+
+Question in the prompt:
+
+| method | 4% | 7% | 10% | 15% | 20% |
+|---|---|---|---|---|---|
+| SnapKV | 10 / .20 | 16 / .31 | 24 / .49 | 24 / .57 | 30 / .63 |
+| DimmerKV on Lexico, question scores | 7 / .15 | 16 / .34 | 23 / .46 | 33 / .79 | 35 / .92 |
+| kvtc, filled | 34 / .79 | 35 / .93 | 35 / .95 | 36 / .98 | 36 / .98 |
+| DimmerKV on kvtc, flat | 34 / .82 | 36 / .97 | 36 / .97 | 36 / .98 | 36 / .98 |
+| DimmerKV on kvtc, question scores | **36 / .93** | 36 / .98 | 36 / .98 | 36 / .98 | 36 / .98 |
+
+Perplexity (full 12.38): 4%: H2O 14.31, DimmerKV-Lexico flat 17.78, kvtc
+filled 12.55, DimmerKV-kvtc flat 12.55, question scores 12.53. 10%: H2O
+13.56, kvtc filled 12.39, DimmerKV-kvtc 12.40 / 12.36. 20%: H2O 13.10,
+DimmerKV-Lexico flat 12.80, kvtc family 12.39.
+
+**Run B**: ~3K-token contexts, 24 needles per mode, 6 perplexity chunks,
+3–5% memory (20–33×). Full: 24/24, perplexity 11.89, prefill ~0.9 s.
+
+| method | after 3% | after 3.5% | after 4% | after 5% | prompt 3% | prompt 3.5% | prompt 4% | prompt 5% | ppl 3% / 4% / 5% |
+|---|---|---|---|---|---|---|---|---|---|
+| H2O | 0 / .00 | 0 / .00 | 0 / .00 | 0 / .00 | 0 / .00 | 0 / .01 | 0 / .01 | 0 / .01 | 13.80 / 13.55 / 13.41 |
+| SnapKV | 0 / .00 | 0 / .00 | 0 / .00 | 0 / .00 | 9 / .33 | 10 / .40 | 12 / .44 | 14 / .51 | 13.76 / 13.48 / 13.33 |
+| kvtc, filled | 23 / .76 | 22 / .79 | 24 / .87 | 24 / .89 | 22 / .76 | 22 / .79 | 23 / .85 | 24 / .89 | 12.14 / 12.05 / 12.03 |
+| DimmerKV on kvtc, flat | 23 / .78 | 23 / .86 | 23 / .87 | 24 / .94 | 22 / .80 | 24 / .88 | 24 / .88 | 24 / .94 | 12.15 / 12.06 / 12.02 |
+| DimmerKV on kvtc, question scores | 22 / .80 | 23 / .87 | 24 / .89 | 24 / .92 | **24 / .91** | **24 / .94** | **24 / .94** | 24 / .94 | **12.07 / 12.03 / 11.98** |
+
+Compression time per 3K-token context: kvtc ~240 ms, DimmerKV on kvtc ~350 ms.
+
+What the grid shows:
+
+- **Eviction collapses at high compression**: H2O 0/24 everywhere at 3–5%;
+  SnapKV 9–14/24 even with the question visible.
+- **kvtc-style coding keeps nearly everything** at 20–33×: 22–24/24 needles,
+  perplexity +1–2%.
+- **DimmerKV on kvtc beats kvtc at equal bytes in every needle column**, by
+  answer probability. The largest gain is question-aware rungs when the
+  question is visible (3%: .76 → .91; 3.5%: .79 → .94; Run A 4%: .79 → .93).
+  Flat rungs alone add +.02–.07. On perplexity question-scored rungs are best
+  at every budget in Run B, but by small margins (≤0.07).
+- Correct counts sit near the ceiling for the kvtc family, so answer
+  probability carries the comparison; differences of 1–2 needles are noise.
+  Still one 1B model.
+- Fixed during this run: `run_grid.py` printed budgets with 2 decimals, which
+  merged 0.035 and 0.04; now `%g`, and the affected rows were rerun.
 
 ## Caveats
 
