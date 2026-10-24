@@ -199,6 +199,7 @@ class KVTCCodec:
                     for kind in choice:
                         choice[kind][picked] = rung + 1
 
+        self.last_choice = choice  # Per-token rungs, for kvtc_storage.encode_bytes.
         used = (tokens - middle) * 2 * self.exact_bytes
         rebuilt, histogram = {}, {}
         for kind, tensors in (("key", keys), ("value", values)):
