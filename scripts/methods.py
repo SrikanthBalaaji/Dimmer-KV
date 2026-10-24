@@ -56,6 +56,8 @@ class Compressed:
     histogram: dict[str, float] = field(default_factory=dict)
     # Optional question-time refinement: refine(tail_ids, context_length) -> (keys, values, fetched bytes).
     refine: object = None
+    # Stored bytes per token (keys + values), for the demo heat map.
+    token_bytes: torch.Tensor | None = None
 
 
 def parse_allocator(spec: str) -> dict:
@@ -163,7 +165,8 @@ class Methods:
         """Compress per-layer [1, kv_heads, tokens, head_dim] keys and values."""
         if name == "full":
             used = 2 * len(keys) * keys[0].numel() * 2
-            return Compressed(keys, values, None, used, 0.0)
+            per_token = torch.full((keys[0].shape[2],), used / keys[0].shape[2], device=self.device)
+            return Compressed(keys, values, None, used, 0.0, token_bytes=per_token)
         if name.startswith(("h2o:", "dkv:")):
             plan = parse_allocator(name)
             chosen = scores["snap" if plan["snap"] else "sum"]
@@ -176,8 +179,11 @@ class Methods:
                 plan["budget"], plan["atom_levels"], exact_recent=self.recent, floor=plan["floor"],
                 key_weight=plan["key_weight"], scope=plan["scope"],
             ))
+            # Per token: share of (layer, head) slots kept x the token's FP16 size (eviction view).
+            kept = 1 - torch.stack(allocation.evicted).float().mean(dim=(0, 1))
+            full = 2 * len(keys) * keys[0].shape[1] * keys[0].shape[3] * 2
             return Compressed(allocation.keys, allocation.values, allocation.evicted,
-                              allocation.used_bytes, seconds, allocation.histogram)
+                              allocation.used_bytes, seconds, allocation.histogram, token_bytes=kept * full)
         if name.startswith("prog@"):
             return self._progressive(name, keys, values, scores)
         if name.startswith(("kvtc@", "kvtcf@", "dkvtc@")):
@@ -196,7 +202,8 @@ class Methods:
                 keys, values, float(budget), self.recent, per_token, fill=name.startswith("kvtcf@"),
                 weights=weights, evict=evict,
             ))
-            return Compressed(new_keys, new_values, codec.last_evicted, used, seconds, histogram)
+            return Compressed(new_keys, new_values, codec.last_evicted, used, seconds, histogram,
+                              token_bytes=self._kvtc_token_bytes(codec, keys[0].shape[2]))
         if name.startswith("lex@"):
             atoms = self._atoms_for_budget(float(name[4:]), keys[0].shape[-2], keys[0].shape[-1])
             specs = [("lex", atoms), ("lex", atoms)]
@@ -232,4 +239,22 @@ class Methods:
                 count = max(1, int(round(fraction * middle)))
                 top = importance[stored.start : stored.end].topk(count).indices + stored.start
                 return stored.refine(hot_keys, hot_values, top)
-        return Compressed(hot_keys, hot_values, None, stored.hot_bytes, seconds, refine=refine)
+        per_token = torch.full((keys[0].shape[2],), 2.0 * codec.base.exact_bytes, device=self.device)
+        per_token[stored.start : stored.end] = sum(
+            codec.orders[kind].prefix_bytes[store.hot_pieces].float() for kind, store in stored.stores.items()
+        )
+        return Compressed(hot_keys, hot_values, None, stored.hot_bytes, seconds, refine=refine,
+                          token_bytes=per_token)
+
+    def _kvtc_token_bytes(self, codec, tokens: int) -> torch.Tensor:
+        """Bytes kept per token (keys + values) from the codec's last rung choice."""
+        per_token = torch.full((tokens,), 2.0 * codec.exact_bytes, device=self.device)
+        start = min(codec.sinks, tokens)
+        middle = codec.last_choice["key"].shape[0]
+        total = torch.zeros(middle, device=self.device)
+        for kind, choice in codec.last_choice.items():
+            sizes = torch.tensor(codec.streams[kind].rung_bytes + [codec.exact_bytes], device=self.device,
+                                 dtype=torch.float32)
+            total += torch.where(choice < 0, torch.zeros_like(total), sizes[choice.clamp_min(0)])
+        per_token[start : start + middle] = total
+        return per_token
