@@ -142,9 +142,14 @@ class KVTCCodec:
             dim=1,
         )
 
-    def compress(self, keys, values, budget: float, exact_recent: int, per_token: bool):
+    def compress(self, keys, values, budget: float, exact_recent: int, per_token: bool,
+                 fill: bool = False, weights: torch.Tensor | None = None):
         """kvtc (same rung for all) or DimmerKV-TC (per-token rungs) under a budget.
 
+        ``fill`` (uniform only) moves an evenly spaced set of tokens one rung up
+        to use the leftover budget, so uniform and per-token runs spend the
+        same bytes. ``weights`` [tokens] (per-token only) scales each token's
+        errors by its importance (mean-normalized over compressed tokens).
         Returns rebuilt per-layer keys and values, counted bytes and a histogram.
         """
         tokens = keys[0].shape[2]
@@ -164,6 +169,9 @@ class KVTCCodec:
                 # Relative error so key and value errors are on one scale; exact rung = 0.
                 energy = (matrices[kind][start:end] - stream.mean).square().sum(dim=1).mean()
                 rung_err = self.rung_errors(coefficients[kind], kind) / energy
+                if weights is not None:
+                    importance = weights[start:end].float()
+                    rung_err = rung_err * (importance / importance.mean().clamp_min(1e-12))[:, None]
                 errors.append(torch.cat([rung_err, torch.zeros_like(rung_err[:, :1])], dim=1))
 
         level_bytes = {kind: self.streams[kind].rung_bytes + [self.exact_bytes] for kind in ("key", "value")}
@@ -181,6 +189,15 @@ class KVTCCodec:
                 raise ValueError(f"Budget {budget:.3f} cannot cover the exact tokens.")
             rung = max(fits)
             choice = {kind: torch.full((middle,), rung, device=self.device) for kind in ("key", "value")}
+            if fill and rung + 1 < len(level_bytes["key"]):
+                base = middle * (level_bytes["key"][rung] + level_bytes["value"][rung])
+                step = (level_bytes["key"][rung + 1] - level_bytes["key"][rung]
+                        + level_bytes["value"][rung + 1] - level_bytes["value"][rung])
+                upgrades = min(middle, (remaining - base) // step)
+                if upgrades > 0:
+                    picked = torch.linspace(0, middle - 1, upgrades, device=self.device).round().long()
+                    for kind in choice:
+                        choice[kind][picked] = rung + 1
 
         used = (tokens - middle) * 2 * self.exact_bytes
         rebuilt, histogram = {}, {}

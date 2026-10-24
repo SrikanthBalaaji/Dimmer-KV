@@ -158,12 +158,13 @@ def run_needles(model, tokenizer, methods: Methods, names, mode="after", seeds=3
             keys = [layer.keys.clone() for layer in cache.layers]
             values = [layer.values.clone() for layer in cache.layers]
             del cache
-            variants = [(name, methods.apply(name, keys, values, scores)) for name in names]
 
         full_replies = []
         with torch.inference_mode():
             ask(keys, values, torch.cat([context_ids, questions[0][0]])[None].to(device))  # Warm-up.
-            for name, compressed in variants:
+            # One method at a time, so only one compressed cache is held in memory.
+            for name in names:
+                compressed = methods.apply(name, keys, values, scores)
                 dimmer.set_eviction(compressed.evicted)
                 entry = stats[name]
                 entry["compress"] += compressed.seconds

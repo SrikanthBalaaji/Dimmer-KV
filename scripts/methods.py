@@ -7,8 +7,11 @@ A method name is one of:
   or ``fp16``. Example: ``pca16/lex8``.
 - ``lex@<budget>``: uniform Lexico with the most atoms that fit the budget.
 - ``kvtc@<budget>``: kvtc transform coding (cross-layer PCA, RoPE removed,
-  grouped bit widths), every token on the same rung; ``dkvtc@<budget>``:
-  the same transform with DimmerKV flat per-token rungs (``kvtc.py``).
+  grouped bit widths), every token on the same rung; ``kvtcf@<budget>``:
+  the same, with evenly spaced tokens moved one rung up to fill the budget;
+  ``dkvtc@<budget>``: the same transform with DimmerKV flat per-token rungs
+  (``kvtc.py``); ``dkvtc@<budget>:snap`` weights each token's error by its
+  question-window attention (summed over layers and heads).
   These keep the first 4 tokens exact (kvtc's sinks) plus the recent window.
 - ``h2o:<budget>`` (keep the highest-scoring tokens exact, evict the rest) or
   ``dkv:<budget>`` (DimmerKV allocator over Lexico prefixes), budget as a
@@ -85,7 +88,7 @@ def budget_of(name: str) -> float:
     if name == "full":
         return 1.0
     if "@" in name:
-        return float(name.split("@")[1])
+        return float(name.split("@")[1].split(":")[0])
     if name.startswith(("h2o:", "dkv:")):
         return float(name.split(":")[1])
     return float("nan")
@@ -163,10 +166,17 @@ class Methods:
             ))
             return Compressed(allocation.keys, allocation.values, allocation.evicted,
                               allocation.used_bytes, seconds, allocation.histogram)
-        if name.startswith(("kvtc@", "dkvtc@")):
+        if name.startswith(("kvtc@", "kvtcf@", "dkvtc@")):
             per_token = name.startswith("dkvtc@")
+            budget, *options = name.split("@")[1].split(":")
+            weights = None
+            if options == ["snap"]:
+                weights = torch.stack(scores["snap"]).sum(dim=(0, 1))
+            elif options:
+                raise ValueError(f"Unknown options in {name!r}; only ':snap' is supported.")
             (new_keys, new_values, used, histogram), seconds = self._timed(lambda: self.codec("kvtc").compress(
-                keys, values, float(name.split("@")[1]), self.recent, per_token
+                keys, values, float(budget), self.recent, per_token, fill=name.startswith("kvtcf@"),
+                weights=weights,
             ))
             return Compressed(new_keys, new_values, None, used, seconds, histogram)
         if name.startswith("lex@"):
