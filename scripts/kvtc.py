@@ -155,7 +155,8 @@ class KVTCCodec:
         )
 
     def compress(self, keys, values, budget: float, exact_recent: int, per_token: bool,
-                 fill: bool = False, weights: torch.Tensor | None = None, evict: bool = False):
+                 fill: bool = False, weights: torch.Tensor | None = None, evict: bool = False,
+                 floor_share: float = 0.0):
         """kvtc (same rung for all) or DimmerKV-TC (per-token rungs) under a budget.
 
         ``fill`` (uniform only) moves an evenly spaced set of tokens one rung up
@@ -166,6 +167,9 @@ class KVTCCodec:
         rung: an evicted key hides the token from attention (its value is then
         evicted too); an evicted value alone decodes to the mean value. The
         per-layer eviction masks are left in ``self.last_evicted``.
+        ``floor_share`` (per-token only) first gives every token the finest rung
+        that uniform kvtc could afford with that share of the budget, then hands
+        out the rest per token; nothing is evicted below the floor.
         Returns rebuilt per-layer keys and values, counted bytes and a histogram.
         """
         tokens = keys[0].shape[2]
@@ -198,11 +202,17 @@ class KVTCCodec:
         level_bytes = {kind: self.streams[kind].rung_bytes + [self.exact_bytes] for kind in ("key", "value")}
         evict_bytes = [0] if evict else []
         if per_token:
+            # Optional floor: the uniform rung affordable with floor_share of the budget.
+            first = 0
+            if floor_share > 0:
+                fits = [r for r in range(len(level_bytes["key"]))
+                        if middle * (level_bytes["key"][r] + level_bytes["value"][r]) <= floor_share * remaining]
+                first = len(evict_bytes) + (max(fits) if fits else 0)
+            levels = [torch.tensor(evict_bytes + level_bytes[kind], device=self.device)[first:]
+                      for kind in ("key", "value")]
             chosen = allocate_rungs(
-                torch.cat(errors),
-                torch.tensor(evict_bytes + level_bytes["key"] + evict_bytes + level_bytes["value"], device=self.device),
-                middle, remaining,
-            ) - len(evict_bytes)  # -1 = evicted.
+                torch.cat([e[:, first:] for e in errors]), torch.cat(levels), middle, remaining,
+            ) + first - len(evict_bytes)  # -1 = evicted.
             choice = {"key": chosen[:middle], "value": chosen[middle:].clone()}
             choice["value"][choice["key"] < 0] = -1  # A hidden token needs no value.
         else:
