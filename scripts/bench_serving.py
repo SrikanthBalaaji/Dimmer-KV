@@ -91,7 +91,11 @@ def main() -> None:
             values = [layer.values.clone() for layer in cache.layers]
             del cache
             stored = {}  # way -> (bytes, restore function returning (keys, values, evicted))
-            host = [t.cpu().pin_memory() for t in keys + values]
+            host = [t.cpu() for t in keys + values]
+            try:
+                host = [t.pin_memory() for t in host]  # Fast host-to-GPU copies.
+            except RuntimeError:
+                pass  # Windows limits pinned memory; fall back to pageable RAM (slower copy).
             stored["full (GPU-resident)"] = (sum(t.numel() * 2 for t in host),
                                              lambda: ([k.clone() for k in keys], [v.clone() for v in values], None))
             stored["full (RAM, FP16)"] = (sum(t.numel() * 2 for t in host), lambda: (
@@ -114,7 +118,7 @@ def main() -> None:
                 compressed = methods.apply(name, keys, values, scores)
                 if name.startswith("h2o"):
                     mask_bytes = config.layers * config.kv_heads * length // 8
-                    payload = torch.empty(compressed.used_bytes + mask_bytes, dtype=torch.uint8).pin_memory()
+                    payload = torch.empty(compressed.used_bytes + mask_bytes, dtype=torch.uint8)
 
                     def restore_h2o(c=compressed, p=payload):
                         p.to(device, non_blocking=True)  # Transfer of kept tokens + mask, timed.
