@@ -752,3 +752,57 @@ AWS setup: `ubuntu@34.203.234.146` (g6e.2xlarge, L40S 46 GB), key
 fit_kvtc → fit_progressive → run_grid (8K, both modes + ppl) →
 bench_serving 16K; logs in `~/dimmerkv/logs`, results in
 `~/dimmerkv/results`. Leave the team's `~/lexico` and `~/lexico-env` alone.
+
+## Progress log (2026-10-25, ~7:45 AM IST): eviction level, faster restore, 3B 16K
+
+**Partial-basis decode.** Rebuilding the cache multiplied every token by the
+full features × features PCA basis, although at low budgets most groups of
+components carry 0 bits. `kvtc.inverse_transform` now multiplies only the
+groups that are non-zero for some token. 1B, 8K tokens: restore 390 → **93 ms**
+at 2% (11 of 128 key groups used) and 234 ms at 5%; the restored cache is
+identical. Applied to kvtc, byte storage and the progressive codec.
+
+**Eviction level (`dkvtc@b:ev`).** A zero-byte level below the coarsest
+rung: an evicted key hides the token from attention (its value is then
+dropped too); an evicted value alone decodes to the mean. This lets DimmerKV
+go below kvtc's minimum (~2% of FP16 at 8K tokens) and mix dropping with
+graded precision in one budget. At budgets that do not need it, it changes
+nothing (identical results at 2–3% without a question).
+
+1B, 8K tokens, 24 questions (`logs/evict_8k_*.log`; full cache 21/24, .756):
+
+| question | method | memory | correct | ans p |
+|---|---|---|---|---|
+| in prompt | SnapKV | 1.5% | 6/24 | .182 |
+| in prompt | **DimmerKV-kvtc, question scores + eviction** | **1.5% (67×)** | **21/24** | **.704** |
+| in prompt | SnapKV | 2% | 10/24 | .295 |
+| in prompt | DimmerKV-kvtc, question scores | 2% | 19/24 | .607 |
+| in prompt | **DimmerKV-kvtc, question scores + eviction** | **2% (50×)** | **22/24** | **.765** |
+| after | H2O | 1.5% | 0/24 | .001 |
+| after | DimmerKV-kvtc + eviction (flat) | 1.5% | 1/24 | .004 |
+| after | kvtc filled / DimmerKV-kvtc (± eviction) | 2% | 17/24 | .48–.50 |
+
+- **With the question visible, DimmerKV with eviction matches the full cache
+  at 1.5–2% of its memory (50–67× smaller)**: it drops 14–38% of tokens the
+  question does not need, spends the bytes on finer precision for relevant
+  ones, and keeps the rest coarse. SnapKV (keep-or-drop with the same scores)
+  keeps 6–10/24.
+- Without the question, eviction does not help: nothing tells it what is
+  safe to drop. That case is handled by progressive refinement (section 11).
+
+**3B on AWS, 16K-token conversations** (18 questions, question after
+compression, before the partial-basis decode; `results/serving_3b_16k.csv`):
+
+| way of keeping it | stored | conversations in 8 GiB | time to first token | correct |
+|---|---|---|---|---|
+| full cache in RAM | 1,753 MiB | 4 | 189 ms | 18/18 |
+| recompute (chunked SDPA) | ~0 | unlimited | 1,434 ms | 18/18 |
+| H2O 2% | 35 MiB | 230 | 61 ms | 0/18 |
+| kvtc / DimmerKV-kvtc 2% | 31 MiB | 263 | ~1,670 ms | 18/18 |
+| kvtc / DimmerKV-kvtc 5% | 78 MiB | 104 | ~1,960 ms | 18/18 |
+
+- 57× more conversations per GiB with every answer correct; H2O answers none.
+- On the L40S, restoring from the compressed copy with the full-basis decode
+  was slower than re-running prefill (1.6–1.9 s vs 1.4 s); this motivated the
+  partial-basis decode above. A rerun with it is queued on AWS.
+
