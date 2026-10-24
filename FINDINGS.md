@@ -1,6 +1,6 @@
 # DimmerKV — experimental findings so far
 
-Status as of Sun 25 Oct 2026, ~1:40 AM IST. Model: Llama-3.2-1B-Instruct (FP16,
+Status as of Sun 25 Oct 2026, ~2:15 AM IST. Model: Llama-3.2-1B-Instruct (FP16,
 16 layers, 8 KV heads, head dim 64) on the LOQ laptop (RTX 5060 8 GB).
 Branch: `codec-rework`. Raw numbers and the run-by-run log are in `CLAUDE.md`;
 logs in `logs/` (not committed); grid results as CSV in `results/`.
@@ -36,7 +36,10 @@ question is visible (`snap`). Sections 6–8.
    needles; restoring takes ~0.16 s versus 0.9–3.8 s to recompute the prefill
    (~86 vs 342 ms at 1.6K tokens). Eviction and Lexico at 10–20× answer
    0–1/24.
-6. Codec history: per-head PCA < Lexico < kvtc-style cross-layer PCA. Keys are
+6. **Serving** (section 9): in a chat-assistant scenario, 8 GiB of RAM holds
+   3,127 compressed 3K-token conversations vs 85 uncompressed (37×); first
+   answer token in ~0.18 s vs 0.89 s to recompute; generation speed unchanged.
+7. Codec history: per-head PCA < Lexico < kvtc-style cross-layer PCA. Keys are
    the fragile stream (section 2).
 
 ## How we test
@@ -461,6 +464,47 @@ Observations:
   8 GB limit), so the 3K speed-up range is wide; the 1.6K numbers are stable.
 - Peak GPU memory is unchanged (Level 1 decodes back to FP16); the savings
   are in storage and transfer size, which is kvtc's use case.
+
+## 9. Serving benchmark in absolute units
+
+`scripts/bench_serving.py`. Scenario: a chat assistant keeps many
+conversations' KV caches in host RAM between turns; a follow-up question
+arrives for one of them. ~3.1K-token conversations, 24 questions (question
+after compression), 32 generated tokens per answer, RAM budget 8 GiB.
+Output: `results/serving.csv`.
+
+| way of keeping the conversation | stored per conversation | conversations in 8 GiB RAM | restore | time to first token | decode tokens/s | extra GPU memory while answering | needles / ans p |
+|---|---|---|---|---|---|---|---|
+| full cache kept on GPU | 96.3 MiB (on GPU) | — | 0.7 ms | 21 ms | 65 | 236 MiB | 24/24 / .95 |
+| full cache in RAM (FP16) | 96.3 MiB | 85 | 4.6 ms | 25 ms | 64 | 236 MiB | 24/24 / .95 |
+| recompute (store only the text) | ~0 | unlimited | 840 ms | 891 ms | 61 | 2,658 MiB | 24/24 / .95 |
+| H2O 5% | 4.9 MiB | 1,685 | 0.3 ms* | 22 ms | 58 | 139 MiB* | **0/24** / .00 |
+| H2O 10% | 9.7 MiB | 846 | 0.6 ms* | 22 ms | 60 | 139 MiB* | **0/24** / .00 |
+| kvtc filled 3% | 2.6 MiB | 3,127 | 146 ms | 171 ms | 60 | 596 MiB | 23/24 / .76 |
+| **DimmerKV-kvtc 3%** | **2.6 MiB** | **3,127** | 154 ms | 176 ms | 61 | 534 MiB | 23/24 / **.78** |
+| kvtc filled 5% | 4.3 MiB | 1,902 | 160 ms | 181 ms | 65 | 608 MiB | 24/24 / .89 |
+| **DimmerKV-kvtc 5%** | 4.3 MiB | 1,896 | 166 ms | 188 ms | 64 | 534 MiB | 24/24 / **.94** |
+
+\* H2O's restore only times the transfer of its kept tokens; its Level 1
+cache stays on the GPU, so its restore time and extra GPU memory are
+understated.
+
+What it shows:
+
+- **Capacity**: DimmerKV-kvtc at 3% fits **3,127 conversations** in 8 GiB of
+  RAM where uncompressed FP16 fits 85 (**37×**), with 23/24 needles. H2O at a
+  larger size (4.9 MiB) answers 0/24.
+- **Latency**: time to first token from the compressed copy is ~0.18 s,
+  **~5× faster than recomputing** the conversation (0.89 s), but slower than
+  copying an uncompressed cache from RAM (25 ms). Compression pays when RAM
+  (or network) is the limit, not when everything already fits.
+- **Generation speed** is unchanged (60–65 tokens/s for all methods): after
+  restore the model works on a normal FP16 cache.
+- **GPU memory** while answering is not reduced (Level 1); decoding needs
+  ~0.3 GiB of temporary space on top of the restored cache. Recompute needs
+  2.6 GiB (eager attention over the whole context).
+- **DimmerKV vs kvtc** at equal size: same capacity and speed (+6–7 ms to
+  restore), higher answer probability (.78 vs .76 at 3%, .94 vs .89 at 5%).
 
 ## Caveats
 
