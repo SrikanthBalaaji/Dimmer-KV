@@ -59,8 +59,14 @@ def dimmer_attention(module, query, key, value, attention_mask, scaling, dropout
         # Attention each key received, summed over queries and the query heads
         # that share its KV head (GQA): [kv_heads, keys].
         received = probabilities[0].sum(dim=1)
-        STATE.scores[module.layer_idx] = received.view(-1, groups, received.shape[-1]).sum(dim=1)
-        # SnapKV-style: only the last ``window`` queries (where a question would be).
+        received = received.view(-1, groups, received.shape[-1]).sum(dim=1)
+        previous = STATE.scores.get(module.layer_idx)
+        if previous is not None:
+            # Chunked prefill: add this chunk's queries to the earlier chunks' sums.
+            received[:, : previous.shape[1]] += previous
+        STATE.scores[module.layer_idx] = received
+        # SnapKV-style: only the last ``window`` queries (where a question would be);
+        # the final chunk overwrites earlier ones, and it always holds the window.
         recent = probabilities[0, :, -STATE.window :].sum(dim=1)
         STATE.window_scores[module.layer_idx] = recent.view(-1, groups, recent.shape[-1]).sum(dim=1)
     output = torch.matmul(probabilities.to(query.dtype), value_states)
@@ -78,24 +84,34 @@ def set_eviction(evicted: list[torch.Tensor] | None) -> None:
     STATE.evicted = {} if evicted is None else dict(enumerate(evicted))
 
 
-def prefill_with_scores(model, input_ids: torch.Tensor, window: int = 32):
-    """Prefill [1, tokens]; return (cache, scores).
+def prefill_with_scores(model, input_ids: torch.Tensor, window: int = 32, chunk: int = 512):
+    """Prefill [1, tokens] in chunks; return (cache, scores).
 
     ``scores["sum"]`` is H2O's accumulated attention each token received from
     all queries; ``scores["snap"]`` counts only the last ``window`` queries
     (SnapKV-style observation window). Each is a per-layer list of
-    [kv_heads, tokens].
+    [kv_heads, tokens]. Chunking keeps the eager attention matrix at
+    [heads, chunk, tokens] so long contexts fit in GPU memory; the last
+    chunk is never shorter than ``window``.
     """
     set_eviction(None)
     STATE.scores, STATE.window_scores = {}, {}
     STATE.window = window
     STATE.scoring = True
+    tokens = input_ids.shape[1]
+    bounds = list(range(0, tokens, chunk)) + [tokens]
+    if len(bounds) > 2 and bounds[-1] - bounds[-2] < window:
+        bounds.pop(-2)
+    cache = None
     try:
-        outputs = model(input_ids=input_ids, use_cache=True)
+        for start, end in zip(bounds[:-1], bounds[1:]):
+            positions = torch.arange(start, end, device=input_ids.device)[None]
+            cache = model(input_ids=input_ids[:, start:end], past_key_values=cache, position_ids=positions,
+                          use_cache=True).past_key_values
     finally:
         STATE.scoring = False
     layers = range(len(STATE.scores))
-    return outputs.past_key_values, {
+    return cache, {
         "sum": [STATE.scores[layer] for layer in layers],
         "snap": [STATE.window_scores[layer] for layer in layers],
     }

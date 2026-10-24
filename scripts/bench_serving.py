@@ -17,6 +17,10 @@ Ways to get the cache back:
 - ``h2o``: copy the kept FP16 tokens plus a keep-mask (transfer timed; the
   Level 1 cache keeps evicted slots masked);
 - kvtc family: inflate the DEFLATE bytes and decode them on the GPU.
+All answering uses the same eager attention (needed for H2O's eviction
+masks), so decode speeds compare like with like; the recompute baseline
+prefills in chunks with PyTorch SDPA, its fastest path here. Prefill for
+compression is chunked so long contexts fit.
 """
 
 from __future__ import annotations
@@ -49,6 +53,7 @@ def main() -> None:
     parser.add_argument("--seeds", type=int, default=4)
     parser.add_argument("--gen-tokens", type=int, default=32)
     parser.add_argument("--ram-gib", type=float, default=8.0)
+    parser.add_argument("--prefill-chunk", type=int, default=1024, help="Chunk size for the recompute baseline.")
     parser.add_argument("--recent", type=int, default=32)
     parser.add_argument("--methods", nargs="+",
                         default=["h2o:0.05", "h2o:0.1", "kvtcf@0.03", "dkvtc@0.03", "kvtcf@0.05", "dkvtc@0.05"])
@@ -94,7 +99,15 @@ def main() -> None:
                 [t.to(device, non_blocking=True) for t in host[config.layers :]], None))
 
             def recompute():
-                out = model(input_ids=context_ids[None].to(device), use_cache=True).past_key_values
+                # Chunked prefill with PyTorch SDPA (the fastest prefill here), as a
+                # server would do for long prompts; then back to the shared attention.
+                model.set_attn_implementation("sdpa")
+                ids_all, out = context_ids[None].to(device), None
+                for start in range(0, length, args.prefill_chunk):
+                    end = min(length, start + args.prefill_chunk)
+                    out = model(input_ids=ids_all[:, start:end], past_key_values=out, use_cache=True,
+                                position_ids=torch.arange(start, end, device=device)[None]).past_key_values
+                model.set_attn_implementation(dimmer.ATTENTION_NAME)
                 return [l.keys for l in out.layers], [l.values for l in out.layers], None
             stored["recompute"] = (length * 4, recompute)  # Only the token ids are kept.
             for name in args.methods:
@@ -133,10 +146,8 @@ def main() -> None:
 
                     (rebuilt, token), ttft = timed(first_token)
                     _, restore_ms = timed(lambda: restore())
-                    generated = token.view(1, 1)
 
                     def decode():
-                        nonlocal generated
                         current = token.view(1, 1)
                         for step in range(args.gen_tokens):
                             position = torch.tensor([[length + ids.shape[1] + step]], device=device)
