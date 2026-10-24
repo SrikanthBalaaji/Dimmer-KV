@@ -33,7 +33,7 @@ def run_perplexity(model, tokenizer, methods: Methods, names, context_tokens=153
     device = methods.device
     config = kv_config(model)
     names = ["full"] + [name for name in names if name != "full"]
-    stats = {name: {"nll": 0.0, "count": 0, "compress": 0.0, "bytes": 0.0} for name in names}
+    stats = {name: {"nll": 0.0, "count": 0, "compress": 0.0, "bytes": 0.0, "skipped": ""} for name in names}
     samples = wikitext_token_chunks(tokenizer, "test", context_tokens + eval_tokens, chunks)
     prefill_time = 0.0
     if device.type == "cuda":
@@ -53,7 +53,11 @@ def run_perplexity(model, tokenizer, methods: Methods, names, context_tokens=153
             values = [layer.values.clone() for layer in cache.layers]
             del cache
             for name in names:
-                compressed = methods.apply(name, keys, values, scores)
+                try:
+                    compressed = methods.apply(name, keys, values, scores)
+                except ValueError as error:  # Budget below this method's minimum: skip it.
+                    stats[name]["skipped"] = str(error)
+                    continue
                 dimmer.set_eviction(compressed.evicted)
                 rebuilt = build_cache([k.clone() for k in compressed.keys],
                                       [v.clone() for v in compressed.values], model)
@@ -71,6 +75,9 @@ def run_perplexity(model, tokenizer, methods: Methods, names, context_tokens=153
     peak = torch.cuda.max_memory_allocated() / 2**20 if device.type == "cuda" else float("nan")
     rows = []
     for name, entry in stats.items():
+        if entry["count"] == 0:
+            print(f"skipped {name}: {entry['skipped']}")
+            continue
         nll = entry["nll"] / entry["count"]
         rows.append({
             "task": "perplexity", "method": name, "budget": budget_of(name),
