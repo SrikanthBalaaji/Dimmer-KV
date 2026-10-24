@@ -557,3 +557,16 @@ What the grid shows:
   Still one 1B model.
 - Fixed during this run: `run_grid.py` printed budgets with 2 decimals, which
   merged 0.035 and 0.04; now `%g`, and the affected rows were rerun.
+
+## Progress log (2026-10-25, ~1:15 AM IST): real storage + memory/time/accuracy benchmark
+
+- `kvtc_storage.py`: kvtc / DimmerKV-TC caches serialized to real bytes
+  (rung ids, bit-packed codes, FP16 shift/scale, exact tokens), DEFLATE via
+  zlib, restored exactly (max abs diff 0.0). `KVTCCodec.compress` keeps the
+  chosen rungs in `last_choice`.
+- `bench_memory.py`: counted/stored/DEFLATE size, compress/DEFLATE/restore
+  time vs re-prefill, needles (after) and perplexity per method.
+- Preliminary (1 context): restore ~80-100 ms vs ~340 ms prefill; DEFLATE
+  ~1.1x on top; stored size = counted + rung ids. Full run (1.5K/3K, 24
+  needles) in progress -> results/memory_time_accuracy.csv. FINDINGS.md
+  updated: new TL;DR (DimmerKV on kvtc), section 8, caveats, next steps.

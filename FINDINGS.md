@@ -1,32 +1,41 @@
 # DimmerKV — experimental findings so far
 
-Status as of Sun 25 Oct 2026, ~0:30 AM IST. Model: Llama-3.2-1B-Instruct (FP16,
+Status as of Sun 25 Oct 2026, ~1:15 AM IST. Model: Llama-3.2-1B-Instruct (FP16,
 16 layers, 8 KV heads, head dim 64) on the LOQ laptop (RTX 5060 8 GB).
 Branch: `codec-rework`. Raw numbers and the run-by-run log are in `CLAUDE.md`;
-logs in `logs/` (not committed).
+logs in `logs/` (not committed); grid results as CSV in `results/`.
 
 ## TL;DR
 
-1. **Lexico beats PCA at every memory budget.** At 27% of FP16 KV memory,
-   uniform Lexico (11 atoms) answers 16/18 needle questions; uniform PCA
-   (32 components) answers 1/18.
-2. **Keys are the fragile stream.** Mixing codecs (PCA keys + Lexico values,
-   or the reverse) is always worse than Lexico for both.
-3. **H2O scores cannot see a question asked after compression.** The hidden
-   facts rank at the 30–35th percentile of H2O scores. Plain H2O at 15%
-   memory: 0/18. Our allocator driven by H2O scores: 0/18.
-4. **The allocator works when it ignores scores** and gives each token the
-   atoms its own reconstruction error needs (`flat`): **10/18 at 15%**
-   (uniform Lexico: 5/18) and **14/18 at 20%** (uniform Lexico needs 22% for
-   9/18).
-5. **Cost: compression time.** The allocator takes ~1.3 s per 1.6K-token
-   context after the OMP speed-up (was ~2.4 s; prefill itself ~0.6 s). Answer speed is unchanged because Level 1
-   rebuilds a normal cache; memory savings are *counted* from the codes.
+Current best system: **DimmerKV on kvtc** — kvtc-style transform coding
+(cross-layer PCA with RoPE removed, grouped 0/2/4/8-bit quantization) as the
+codec, with DimmerKV choosing a precision rung per token under one byte budget,
+by error per byte (`flat`) or weighted by question-window attention when the
+question is visible (`snap`). Sections 6–8.
 
-This changes the pitch from "keep important tokens bright" to
-**"give each token the bytes its own content needs"**. Attention-based
-importance is still useful, but only once the question is known (see Next
-steps).
+1. **kvtc-style coding changes the scale.** At 3–5% of FP16 KV memory
+   (20–33×), it keeps 22–24/24 needles and perplexity within 1–2% of the full
+   cache on 3K-token contexts. Our earlier Lexico-based system needed ~20% for
+   similar needle accuracy (section 7).
+2. **DimmerKV on kvtc beats kvtc at equal bytes in every needle column.** The
+   clearest gain is question-aware rungs when the question is visible
+   (3% memory: answer probability .76 → .91; 22 → 24/24). Flat rungs alone add
+   +.02–.07. Perplexity differences are small (≤0.07).
+3. **Eviction collapses at high compression.** H2O answers 0/24 at every
+   3–5% budget and 0/36 at 4–20% on short contexts when the question comes
+   after compression: before the question exists, the facts rank at the
+   30–35th percentile of H2O scores (section 3). SnapKV, which sees the
+   question, keeps only 9–14/24 at 3–5%.
+4. **Per-token allocation is the robust part of the original idea.** On Lexico
+   it doubled needle accuracy at equal bytes (section 3); on kvtc it is a
+   smaller but consistent gain. Summed H2O attention as the importance signal
+   hurts; question-window attention helps.
+5. **Real storage and time** (section 8, preliminary): the compressed cache is
+   written to real bytes (bit-packed, DEFLATE) and restored exactly; restoring
+   takes ~80–100 ms per 1.6K-token context versus ~340 ms to recompute the
+   prefill. DEFLATE adds ~1.1× on top of quantization.
+6. Codec history: per-head PCA < Lexico < kvtc-style cross-layer PCA. Keys are
+   the fragile stream (section 2).
 
 ## How we test
 
@@ -360,52 +369,108 @@ What the grid shows:
 - Fixed during this run: `run_grid.py` printed budgets with 2 decimals, which
   merged 0.035 and 0.04; now `%g`, and the affected rows were rerun.
 
+## 8. Memory, time and accuracy (real storage)
+
+`scripts/kvtc_storage.py` writes a kvtc / DimmerKV-TC cache to one byte
+string: per stream, each compressed token's rung id (1 byte), then per rung
+the bit-packed 2/4/8-bit codes and the FP16 shift and scale per (token,
+group), then the exact tokens (4 sinks + 32 recent) as FP16. It is then
+DEFLATE-compressed with zlib (level 6, CPU), as kvtc does with nvCOMP.
+`decode_bytes` restores the per-layer cache tensors; the restored cache is
+**identical** to the in-memory compressed one (max abs difference 0.0).
+
+`scripts/bench_memory.py` reports, per method and context length: counted,
+stored and DEFLATE size; compression, DEFLATE and restore time
+(inflate + unpack + inverse transform + re-apply RoPE), against re-running
+prefill; and needle accuracy (question after compression) and perplexity on
+the same contexts. Output: `results/memory_time_accuracy.csv`.
+
+**Preliminary (one 1.6K-token context, 6 needles, 1 perplexity chunk;
+the full run with 1.5K and 3K contexts and 24 needles is in progress):**
+
+| method | stored / FP16 | after DEFLATE | × smaller | compress ms | DEFLATE ms | restore ms | needles / ans p | ppl |
+|---|---|---|---|---|---|---|---|---|
+| full FP16 | 1.000 | 0.907 | 1.1 | — | 1,292 | 240 | 6/6 / .97 | 16.46 |
+| H2O 5% | 0.050 (counted) | — | 20 | 20 | — | — | 0/6 / .00 | 17.34 |
+| H2O 10% | 0.100 (counted) | — | 10 | 21 | — | — | 0/6 / .00 | 17.33 |
+| Lexico 10% | 0.082 (counted) | — | 12 | 553 | — | — | 0/6 / .00 | 18.14 |
+| DimmerKV-Lexico flat 10% | 0.100 (counted) | — | 10 | 1,482 | — | — | 0/6 / .01 | 16.95 |
+| kvtc 5% | 0.043 | 0.039 | 25.7 | 137 | 60 | 82 | 6/6 / .82 | 16.61 |
+| kvtc filled 5% | 0.050 | 0.045 | 22.0 | 119 | 67 | 79 | 6/6 / .82 | 16.49 |
+| **DimmerKV-kvtc 5%** | 0.050 | 0.046 | 21.9 | 186 | 65 | 84 | 6/6 / **.88** | 16.50 |
+| kvtc 10% | 0.084 | 0.075 | 13.3 | 115 | 115 | 86 | 6/6 / .94 | 16.49 |
+| kvtc filled 10% | 0.100 | 0.090 | 11.1 | 120 | 138 | 91 | 5/6 / .89 | 16.51 |
+| **DimmerKV-kvtc 10%** | 0.100 | 0.090 | 11.1 | 177 | 136 | 103 | 6/6 / **.95** | **16.47** |
+
+Re-running prefill for this context takes ~340 ms; restoring the compressed
+cache takes ~80–100 ms (~3.5–4× faster time to first token), from storage
+11–26× smaller than FP16.
+
+Observations:
+
+- Stored size equals the counted size plus the per-token rung ids (≤0.1%), so
+  the byte accounting used in all earlier sections holds for real storage.
+- DEFLATE adds ~1.1× on top of quantization (kvtc reports ~1.23× with GPU
+  nvCOMP); on raw FP16 it gives only 1.1× in total.
+- DEFLATE runs on the CPU here (60–140 ms for the compressed cache, 1.3 s for
+  raw FP16); a GPU codec would cut this.
+- Peak GPU memory is unchanged (Level 1 decodes back to FP16); the savings
+  are in storage / transfer size, which is kvtc's use case.
+
 ## Caveats
 
-- One small model, ~1.6K-token contexts, synthetic needles, 18 questions.
-  Perplexity, LongBench and GSM8K are not run yet.
-- Level 1 only: memory is counted from the codes; the GPU tensor is still
-  FP16, so peak GPU memory and answer speed do not change yet.
-- Compression time (~1.3 s per 1.6K tokens) is still ~2x prefill; it
-  includes a 16-atom OMP on every slot.
-- One unexplained detail: a few vectors reconstruct very badly under the
-  per-head PCA basis (minimum cosine about −0.8) while the 5th percentile is
-  fine; probably near-zero vectors. PCA is now only a baseline, so this is
-  low priority.
+- One small model (Llama-3.2-1B), 1.6K–3K-token contexts, synthetic needles
+  (18–36 per setting), 4–8 perplexity chunks. LongBench and GSM8K not run.
+- The kvtc family is near the ceiling on needle counts at 3–20% memory;
+  answer probability carries the comparison. Differences of 1–2 needles are
+  noise.
+- Our kvtc is "kvtc-style", simplified: greedy bit ladder instead of the
+  paper's DP, fixed groups of 64, zlib on CPU, 4 sinks + 32 recent exact
+  (paper: 128). Numbers are ours, not a reproduction of the paper.
+- Level 1 only: compressed caches are decoded back to FP16 before attention,
+  so peak GPU memory and decode speed do not change; savings are in storage
+  and transfer.
+- `dkvtc:snap` in the "question after compression" mode uses the last 32
+  context tokens as its window (no question); its gains there are small.
 
 ## Next steps (proposed)
 
-1. ~~Faster OMP~~ done (2×, section 5). Further options: cap codes at 11
-   atoms (~30% less), compress off the critical path, a fused search
-   kernel on the Linux GPU.
-2. **Attention-aware error**: weight key error by query statistics from
-   calibration, so "error" means error that changes attention. Free at
-   question time; might move the 10% cliff.
-3. **Refine on demand** (plan extension 3): when the question arrives, score
-   the compressed tokens against it and fetch exact copies of the top few
-   from CPU memory. Section 4 shows question-window scores are an excellent
-   signal (17/18 at 15% when available before compression), so this is now
-   the most promising extension. CPU-side bytes must be reported separately.
-4. **Wider checks**: perplexity, 4K contexts, more needles, then the main runs
-   on the big GPU.
-5. **Demo and pitch**: update the "H2O vs DimmerKV" story and the per-token
-   heat map to show atoms per token (error-driven) rather than attention
-   brightness.
+1. **Bigger models on AWS**: kvtc calibration for 3B/8B on the GPU with a
+   truncated basis (~10K components, as in the paper: 8B has 32,768 features
+   per token), then `run_grid.py` with the kvtc family at 2–5% on 4–8K
+   contexts and 50+ needles.
+2. **Eviction as a rung**: a zero-byte option in the ladder so DimmerKV can
+   drop clearly useless tokens at extreme budgets (kvtc lists eviction as
+   future work).
+3. **Refine on demand** for questions after compression: score compressed
+   tokens against the question and restore exact copies of the top few from
+   CPU storage. Question-window scores are a strong signal (section 7).
+4. **Harder tests**: multi-hop needles (variable tracking), longer contexts,
+   LongBench subset with the question in the prompt.
+5. **Demo and pitch**: "kvtc compresses every token alike; DimmerKV decides
+   per token". Heat map of rungs per token; storage size / restore time vs
+   recompute; H2O failing after compression.
 
 ## Reproduce
 
 ```powershell
 $py = "$env:USERPROFILE\.venvs\hashcode\Scripts\python.exe"
-& $py scripts\fit_pca_basis.py --per-head        # checkpoints\pca_basis.pt
+# Calibration (checkpoints are gitignored; refit per machine and per model)
+& $py scripts\fit_kvtc.py                        # checkpoints\kvtc.pt, ~1.3 min
 & $py scripts\train_lexico.py --steps 1500       # checkpoints\lexico_dict.pt, ~19 min
-& $py scripts\bench_codecs.py                    # codec error / bytes / time
-& $py scripts\test_generation.py                 # needle test, default configs
-& $py scripts\test_generation.py --configs lex5 h2o:0.15 dkv:0.15 dkv:0.15:flat
+& $py scripts\fit_pca_basis.py --per-head        # checkpoints\pca_basis.pt
+# Evaluation
+& $py scripts\test_generation.py --configs kvtcf@0.05 dkvtc@0.05 dkvtc@0.05:snap h2o:0.05
+& $py scripts\test_generation.py --mode prompt --configs kvtcf@0.03 dkvtc@0.03:snap h2o:0.03:snap
+& $py scripts\eval_perplexity.py --configs kvtcf@0.05 dkvtc@0.05 h2o:0.05
+& $py scripts\run_grid.py --model meta-llama/Llama-3.2-1B-Instruct --dictionary checkpoints\lexico_dict.pt `
+      --budgets 0.03 0.05 --templates "h2o:{b}" "kvtcf@{b}" "dkvtc@{b}" "dkvtc@{b}:snap" --context-tokens 3000
+& $py scripts\bench_memory.py                    # memory / time / accuracy table
+# Diagnostics
+& $py scripts\bench_codecs.py                    # PCA vs Lexico error, bytes, time
 & $py scripts\diagnose_scores.py                 # needle rank under H2O scores
-& $py scripts	est_generation.py --mode prompt --configs h2o:0.15:snap dkv:0.15:snap
 & $py scripts\compare_omp.py                     # new vs original OMP
-& $py scripts\profile_allocator.py               # allocator stage timings
+& $py scripts\profile_allocator.py               # Lexico allocator stage timings
 ```
 
-Checkpoints are gitignored; refit them on each machine, and refit after
-changing the model.
+Method names are documented at the top of `scripts/methods.py`.
