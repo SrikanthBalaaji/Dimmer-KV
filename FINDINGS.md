@@ -1,11 +1,11 @@
 # DimmerKV — experimental findings so far
 
-Status as of Sun 25 Oct 2026, ~0:40 AM IST. Model: Llama-3.2-1B-Instruct (FP16,
+Status as of Sun 25 Oct 2026, ~2:35 AM IST. Model: Llama-3.2-1B-Instruct (FP16,
 16 layers, 8 KV heads, head dim 64) on the LOQ laptop (RTX 5060 8 GB).
 Branch: `codec-rework`. Raw numbers and the run-by-run log are in `CLAUDE.md`;
 logs in `logs/` (not committed); grid results as CSV in `results/`.
 
-## Recap of all testing (Sat 24 Oct 3 PM → Sun 25 Oct 0:40 AM)
+## Recap of all testing (Sat 24 Oct 3 PM → Sun 25 Oct 2:35 AM)
 
 Runs on Llama-3.2-1B-Instruct, RTX 5060 laptop (8 GB), unless marked
 3B (Llama-3.2-3B-Instruct on an AWS L40S). Main test: hidden
@@ -31,6 +31,7 @@ question is asked; plus perplexity, timing, and real storage size.
 | 13 | Eviction as a precision level, question in the prompt, 8K | Matches the full cache at 1.5–2% (21–22/24 vs 21/24); SnapKV 6–10/24 |
 | 14 | Partial-basis decode | Restore 390 → 93 ms at 2% on 8K tokens, identical cache |
 | 15 | 3B serving at 16K on AWS | 57× more conversations per GiB, 18/18 correct; H2O 0/18 |
+| 16 | Attention directly over the compressed cache (keys per layer, values never decoded) | Same answers 60/60; GPU memory while answering 253 MB → 18–31 MB at 2%, ~0.9× speed |
 
 **Headline comparison** (8K-token conversations, 24 questions):
 
@@ -753,6 +754,49 @@ compression, before the partial-basis decode; `results/serving_3b_16k.csv`):
   was slower than re-running prefill (1.6–1.9 s vs 1.4 s); this motivated the
   partial-basis decode above. A rerun with it is queued on AWS.
 
+## 13. Answering directly from the compressed cache (no full decode)
+
+Until now compression saved storage and transfer only: before answering, the
+cache was rebuilt to full FP16 on the GPU. `scripts/compressed_attention.py`
+attends over the compressed tokens directly:
+
+- **Keys, decoded one layer at a time:** when attention reaches layer *l*,
+  only that layer's keys are rebuilt (coefficients × that layer's slice of
+  the cross-layer basis + mean, then RoPE at their positions), used, and
+  discarded.
+- **Values, never decoded:** the output Σₙ pₙ vₙ equals
+  (Σₙ pₙ cₙ) · B_v + mean_v · Σₙ pₙ, so attention weights the small
+  coefficient vectors and applies the basis once per head.
+- Coefficients are kept in FP16, grouped by precision step with one shared
+  basis of the components actually used; tiny groups are merged. Evicted
+  keys are left out. Sinks, the recent window and new question/answer tokens
+  sit in a small ordinary cache; both parts share one softmax.
+
+Test (`scripts/test_compressed_attention.py`, 1B, ~8K tokens, 12 questions
+per method, question after compression; `logs/compressed_attention_8k_*.log`):
+
+| method | same answer as rebuilt cache | GPU memory held per conversation | extra working memory while answering | tokens/s (rebuilt → direct) |
+|---|---|---|---|---|
+| kvtc 2% | 12/12 (max logit diff 0.047) | 253 MB → **18.3 MB** | 506 → 63 MB | 45.3 → 40.5 |
+| DimmerKV 2% | 12/12 (0.039) | 253 MB → **22.1 MB** | 506 → 62 MB | 44.5 → 38.6 |
+| DimmerKV + question scores + eviction 2% | 12/12 (0.047) | 253 MB → **31.4 MB** | 506 → 64 MB | 30.8 → 31.2 |
+| kvtc 5% | 12/12 (0.055) | 253 MB → 54.6 MB | 507 → 62 MB | 42.5 → 29.2 |
+| DimmerKV 5% | 12/12 (0.063) | 253 MB → 60.0 MB | 506 → 66 MB | 39.6 → 23.1 |
+
+- **Same answers on all 60 questions**; logits differ only by FP16 rounding.
+- **GPU memory while answering drops 8–14× at 2%** (held) and ~8× in
+  working memory; the saving is no longer only in storage.
+- **Speed**: about 0.87–1.0× of the rebuilt cache at 2%, 0.58–0.69× at 5%
+  (more components to rebuild per layer per token).
+- Not counted per conversation: the kept basis rows (24–200 MB here), a
+  per-model constant like the weights. Prefill still builds the full cache
+  once before compressing (streaming compression during prefill is a next
+  step). Coefficients are held as FP16, ~3× the packed storage size.
+- Two earlier variants were measured and replaced: one union of components
+  for all tokens (faster at 2%, 25–32 MB held) and per-step blocks with
+  their own basis copies (18 MB held but up to 721 MB of duplicated basis
+  and 20 tok/s with many steps).
+
 ## Caveats
 
 - One small model (Llama-3.2-1B), 1.6K–3K-token contexts, synthetic needles
@@ -763,9 +807,9 @@ compression, before the partial-basis decode; `results/serving_3b_16k.csv`):
 - Our kvtc is "kvtc-style", simplified: greedy bit ladder instead of the
   paper's DP, fixed groups of 64, zlib on CPU, 4 sinks + 32 recent exact
   (paper: 128). Numbers are ours, not a reproduction of the paper.
-- Level 1 only: compressed caches are decoded back to FP16 before attention,
-  so peak GPU memory and decode speed do not change; savings are in storage
-  and transfer.
+- Answering directly from the compressed cache (section 13) is implemented for
+  the kvtc family; the progressive codec and Lexico still rebuild an FP16
+  cache. Prefill still builds the full cache once before compressing.
 - `dkvtc:snap` in the "question after compression" mode uses the last 32
   context tokens as its window (no question); its gains there are small.
 

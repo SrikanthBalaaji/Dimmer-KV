@@ -201,6 +201,7 @@
   <li><strong>Progressive bit-planes + question-time refinement</strong><span class="res">Encode once at 8 bits, store planes most-important first; keep a small hot prefix, fetch the rest only for the tokens the question needs. Fixed most of the "question after compression" gap: ans p .50 → .71 (full .75) for 0.5% extra bytes. <span class="tag kept">kept</span></span></li>
   <li><strong>Eviction as a zero-byte precision level</strong><span class="res">Lets DimmerKV mix dropping with graded precision under one budget. With question scores it matched the full cache at 1.5–2% (21–22 vs 21 of 24); SnapKV got 6–10. <span class="tag kept">kept</span></span></li>
   <li><strong>Partial-basis decode</strong><span class="res">Decode only the PCA groups that carry bits. Restore 4× faster; on the 3B model restoring became 2.3× faster than re-reading. <span class="tag kept">kept</span></span></li>
+  <li><strong>Attention over the compressed cache</strong><span class="res">Keys rebuilt one layer at a time, values never decoded (attention weights the coefficients, then applies the basis). Same answers on 60/60 questions; GPU memory while answering 253 MB → 18–31 MB at 2% for an 8K-token conversation, at about 0.9× the speed. <span class="tag kept">kept</span></span></li>
   <li><strong>3B model on an AWS L40S</strong><span class="res">The same conclusions on a bigger model; the kvtc family stays at or near the full cache down to 2%, eviction collapses. <span class="tag kept">validated</span></span></li>
 </ol>
 </section>
@@ -374,9 +375,9 @@
   <text class="s" x="825" y="660" text-anchor="middle">rebuild just their K/V</text>
   <rect class="box model" x="452" y="716" width="484" height="90" rx="10"/>
   <text class="t" x="694" y="742" text-anchor="middle">Llama answers</text>
-  <text class="s" x="694" y="760" text-anchor="middle">normal FP16 attention over the rebuilt cache</text>
-  <text class="s" x="694" y="776" text-anchor="middle">(dropped tokens masked per layer and head)</text>
-  <text class="s" x="694" y="792" text-anchor="middle">same tokens/s as the uncompressed model</text>
+  <text class="s" x="694" y="760" text-anchor="middle">over the codes: keys rebuilt per layer, values never decoded</text>
+  <text class="s" x="694" y="776" text-anchor="middle">(or over a rebuilt FP16 cache; dropped tokens masked)</text>
+  <text class="s" x="694" y="792" text-anchor="middle">GPU memory 253 → 18–31 MB (8K tokens, 2%)</text>
   <rect class="box" x="28" y="716" width="392" height="90" rx="10"/>
   <text class="t" x="224" y="742" text-anchor="middle">Baselines on the same path</text>
   <text class="s" x="224" y="760" text-anchor="middle">full cache in RAM · recompute from text (chunked SDPA)</text>
@@ -475,7 +476,7 @@
 <section id="limits">
 <h2>Limits, stated plainly</h2>
 <ul class="tight">
-  <li><strong>Savings are in storage and transfer</strong> (RAM, disk, network). After restore the model works on a normal FP16 cache, so GPU memory and generation speed during answering are unchanged.</li>
+  <li><strong>Answering directly from the compressed cache</strong> gives identical answers with 8–14× less GPU memory at 2%, but runs at about 0.9× the speed at 2% and 0.6–0.7× at 5%. It covers the kvtc family; the progressive codec still rebuilds an FP16 cache, and prefill still builds the full cache once.</li>
   <li><strong>Without the question, per-token precision alone is only slightly better than kvtc</strong> (often tied at 8K tokens); the gains come from question scores and question-time refinement.</li>
   <li><strong>The 3B model is near the ceiling</strong> on our needle test at 2%, so methods are hard to separate there; harder tasks and an 8B run are next.</li>
   <li><strong>Our kvtc is simplified</strong>: greedy bit allocation instead of the paper's dynamic program, fixed groups of 64, zlib on the CPU. Numbers are ours, not a reproduction.</li>

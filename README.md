@@ -54,8 +54,10 @@ and a single byte budget is spent where it removes the most error.
 4. **Restore and refine per question.** Decode only the PCA groups that carry bits and re-apply RoPE.
    When the question arrives, score the restored cache with it and **fetch the full bit-planes for its
    top ~1% of tokens**.
-5. **Answer.** The model attends over a normal FP16 cache, so generation speed is unchanged. Dropped
-   tokens are masked.
+5. **Answer, without rebuilding the cache.** Attention runs over the compressed tokens directly: keys are
+   rebuilt one layer at a time and discarded, values are never decoded (attention weights the small
+   coefficient vectors, then applies the basis once per head). Answers are identical to the
+   fully decoded cache, and GPU memory while answering drops 8–14× at a 2% budget.
 
 ## What is new
 
@@ -78,6 +80,8 @@ Specific contributions:
   most of the gap when the question comes after compression, for 0.5% extra bytes.
 - **Partial-basis decode.** Only PCA groups that carry bits are multiplied, so restoring is 4× faster
   and beats re-reading the conversation.
+- **Attention in the compressed domain.** Keys decoded per layer on the fly and values used directly in
+  coefficient space, so the full FP16 cache never exists while answering.
 
 ## Performance
 
@@ -114,7 +118,17 @@ in WikiText and asks about them.
 | H2O, 2% | 35 MiB | 230 | 61 ms | **0/18** |
 | **kvtc / DimmerKV, 2%** | **31 MiB** | **263 (57×)** | **488–627 ms** | **18/18** |
 
-Generation speed is the same for every method (about 26 tokens/s on 3B, 46 on 1B).
+Generation speed is the same for every method (about 26 tokens/s on 3B, 46 on 1B) when the cache is
+rebuilt before answering.
+
+**Answering directly from the compressed cache** (1B, 8K tokens, 12 questions per method)
+
+| method | same answers as rebuilt cache | GPU memory held per conversation | tokens/s (rebuilt → direct) |
+|---|---|---|---|
+| kvtc 2% | 12/12 | 253 MB → **18 MB** | 45 → 41 |
+| DimmerKV 2% | 12/12 | 253 MB → **22 MB** | 45 → 39 |
+| DimmerKV + question scores + eviction 2% | 12/12 | 253 MB → **31 MB** | 31 → 31 |
+| kvtc 5% | 12/12 | 253 MB → 55 MB | 43 → 29 |
 
 **Perplexity: 3B, 8K tokens** (full cache 8.33; lower is better)
 
@@ -136,6 +150,7 @@ Generation speed is the same for every method (about 26 tokens/s on 3B, 46 on 1B
 | Question scores + eviction level (1B, 8K, 1.5%, question known) | SnapKV 6/24 | 21/24 (= full cache) |
 | Partial-basis decode (restore time, 1B 8K / 3B 16K, 2%) | 390 ms / 1,597 ms | 93 ms / 416 ms |
 | Faster OMP for Lexico (encode time) | 70 ms/stream | 33 ms/stream |
+| Attention over codes instead of a rebuilt cache (GPU memory while answering, 1B 8K, 2%) | 253 MB | 18–31 MB |
 
 ## Run it
 
@@ -152,6 +167,7 @@ $py = "$env:USERPROFILE\.venvs\hashcode\Scripts\python.exe"
 & $py scripts\test_generation.py --mode prompt --context-tokens 8000 --configs h2o:0.02:snap dkvtc@0.02:snap:ev
 & $py scripts\eval_perplexity.py --configs kvtcf@0.03 dkvtc@0.03:snap h2o:0.03
 & $py scripts\bench_serving.py --context-tokens 8000 --methods h2o:0.02 kvtcf@0.02 dkvtc@0.02
+& $py scripts\test_compressed_attention.py --context-tokens 8000 --methods kvtcf@0.02 dkvtc@0.02
 & $py scripts\run_grid.py --model meta-llama/Llama-3.2-1B-Instruct --budgets 0.02 0.05 --templates "h2o:{b}" "kvtcf@{b}" "dkvtc@{b}"
 ```
 
@@ -166,6 +182,7 @@ the top of [`scripts/methods.py`](scripts/methods.py).
 | `scripts/progressive.py`, `fit_progressive.py` | progressive bit-planes, hot/cold tiers, question-time refinement |
 | `scripts/kvtc_storage.py` | real byte storage (bit-packing, DEFLATE) and partial-basis restore |
 | `scripts/dimmer.py` | attention hook: H2O / question-window scores, per-head eviction masks, chunked prefill |
+| `scripts/compressed_attention.py` | attention directly over the compressed cache (keys per layer, values never decoded) |
 | `scripts/methods.py` | one name per method, shared by every script and the demo |
 | `scripts/test_generation.py`, `eval_perplexity.py`, `bench_serving.py`, `bench_memory.py`, `run_grid.py` | needle tests, perplexity, serving benchmark, storage/time benchmark, CSV grid runner |
 | `scripts/demo_app.py` | Gradio demo: side-by-side methods, all-methods leaderboard, per-token heat map |
@@ -175,8 +192,9 @@ the top of [`scripts/methods.py`](scripts/methods.py).
 
 ## Limits
 
-- **Savings are in storage and transfer** (RAM, disk, network). After restore the model works on a
-  normal FP16 cache, so GPU memory and generation speed during answering are unchanged.
+- **Answering directly from the compressed cache** works for the kvtc family and gives identical answers,
+  but costs speed at larger budgets (about 0.9× at 2%, 0.6–0.7× at 5%). The progressive codec still
+  rebuilds an FP16 cache, and prefill still builds the full cache once before compressing.
 - **Without the question, per-token precision alone is only slightly better than kvtc** (often tied at
   8K tokens); the clear gains come from question scores and question-time refinement.
 - **The 3B model is near the ceiling** of our needle test at 2%, so methods are hard to separate there.

@@ -806,3 +806,12 @@ compression, before the partial-basis decode; `results/serving_3b_16k.csv`):
   was slower than re-running prefill (1.6–1.9 s vs 1.4 s); this motivated the
   partial-basis decode above. A rerun with it is queued on AWS.
 
+
+## Progress log (2026-10-25, ~2:35 AM IST): attention directly over the compressed cache
+
+`scripts/compressed_attention.py` (+ hook in `dimmer.py`, coefficients exposed
+by `kvtc.py`): keys rebuilt one layer at a time, values used in coefficient
+space, exact tokens in a small cache. 1B, 8K tokens: same answers 60/60;
+GPU memory held per conversation 253 MB -> 18-31 MB at 2%; ~0.9x speed at 2%,
+0.6-0.7x at 5%. Details in FINDINGS.md section 13; test:
+`scripts/test_compressed_attention.py`.
