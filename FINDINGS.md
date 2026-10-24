@@ -1,6 +1,6 @@
 # DimmerKV — experimental findings so far
 
-Status as of Sat 24 Oct 2026, ~7 PM IST. Model: Llama-3.2-1B-Instruct (FP16,
+Status as of Sat 24 Oct 2026, ~9 PM IST. Model: Llama-3.2-1B-Instruct (FP16,
 16 layers, 8 KV heads, head dim 64) on the LOQ laptop (RTX 5060 8 GB).
 Branch: `codec-rework`. Raw numbers and the run-by-run log are in `CLAUDE.md`;
 logs in `logs/` (not committed).
@@ -19,8 +19,8 @@ logs in `logs/` (not committed).
    atoms its own reconstruction error needs (`flat`): **10/18 at 15%**
    (uniform Lexico: 5/18) and **14/18 at 20%** (uniform Lexico needs 22% for
    9/18).
-5. **Cost: compression time.** The allocator takes ~2.4 s per 1.6K-token
-   context (prefill itself ~0.5 s). Answer speed is unchanged because Level 1
+5. **Cost: compression time.** The allocator takes ~1.3 s per 1.6K-token
+   context after the OMP speed-up (was ~2.4 s; prefill itself ~0.6 s). Answer speed is unchanged because Level 1
    rebuilds a normal cache; memory savings are *counted* from the codes.
 
 This changes the pitch from "keep important tokens bright" to
@@ -206,13 +206,50 @@ What this shows:
   context arrives, and re-allocate or refine with question-window scores
   when a question comes in.
 
+## 5. Faster OMP and full rerun
+
+OMP now keeps an orthonormal basis of the chosen atoms (Gram-Schmidt), so
+each step is a projection instead of a linear solve, with one solve at the
+end; the search over 4,096 atoms runs in FP16. Checked against the original
+(`scripts/compare_omp.py`, 32 layer/streams × 8,176 held-out vectors): the
+same atom in 97.7% of slots, identical stored-code error to 4 decimals at
+4/8/16 atoms, **2.0× faster**. The allocator went from ~2.4 s to ~1.3 s per
+1.6K-token context. The remaining time is the FP16 atom search, which is
+memory-bound (~1.3 ms per step).
+
+Full needle suite rerun with the new OMP (18 questions; correct, ans p):
+
+| memory | config | question after compression | question in prompt |
+|---|---|---|---|
+| 10% | uniform Lexico 3 | 0 (0.002) | 1 (0.010) |
+| | H2O / SnapKV eviction | 0 (0.002) | 12 (0.381) |
+| | DimmerKV flat | 1 (0.010) | 4 (0.119) |
+| | DimmerKV snap | — | **13 (0.482)** |
+| 15% | uniform Lexico 5 | 5 (0.028) | 7 (0.104) |
+| | H2O eviction (summed) | 0 (0.003) | 1 (0.016) |
+| | SnapKV eviction | — | 10 (0.404) |
+| | DimmerKV flat | **10 (0.262)** | 13 (0.521) |
+| | DimmerKV snap | — | **17 (0.909)** |
+| 20–22% | uniform Lexico 8 (22%) | 10 (0.289) | 12 (0.453) |
+| | H2O / SnapKV eviction | 0 (0.003) | 13 (0.436) |
+| | DimmerKV flat | **14 (0.684)** | 17 (0.852) |
+| | DimmerKV snap | — | **17 (0.869)** |
+
+(H2O rows in the "after" column use summed scores; SnapKV rows in the
+"prompt" column use the last-32-query window. "—" = not run: snap scores
+have no question to see in the "after" mode.)
+
+Every number matches the old-OMP runs within one question. At 20% with the
+question in the prompt, flat and snap both reach 17/18.
+
 ## Caveats
 
 - One small model, ~1.6K-token contexts, synthetic needles, 18 questions.
   Perplexity, LongBench and GSM8K are not run yet.
 - Level 1 only: memory is counted from the codes; the GPU tensor is still
   FP16, so peak GPU memory and answer speed do not change yet.
-- Compression time includes a 16-atom OMP on every slot; not optimized.
+- Compression time (~1.3 s per 1.6K tokens) is still ~2x prefill; it
+  includes a 16-atom OMP on every slot.
 - One unexplained detail: a few vectors reconstruct very badly under the
   per-head PCA basis (minimum cosine about −0.8) while the 5th percentile is
   fine; probably near-zero vectors. PCA is now only a baseline, so this is
@@ -220,9 +257,9 @@ What this shows:
 
 ## Next steps (proposed)
 
-1. **Faster OMP**: grow the solution step by step instead of re-solving, and
-   use FP16 for the atom search. Target: compression faster than prefill
-   before the 4–8K main runs.
+1. ~~Faster OMP~~ done (2×, section 5). Further options: cap codes at 11
+   atoms (~30% less), compress off the critical path, a fused search
+   kernel on the Linux GPU.
 2. **Attention-aware error**: weight key error by query statistics from
    calibration, so "error" means error that changes attention. Free at
    question time; might move the 10% cliff.
@@ -247,6 +284,9 @@ $py = "$env:USERPROFILE\.venvs\hashcode\Scripts\python.exe"
 & $py scripts\test_generation.py                 # needle test, default configs
 & $py scripts\test_generation.py --configs lex5 h2o:0.15 dkv:0.15 dkv:0.15:flat
 & $py scripts\diagnose_scores.py                 # needle rank under H2O scores
+& $py scripts	est_generation.py --mode prompt --configs h2o:0.15:snap dkv:0.15:snap
+& $py scripts\compare_omp.py                     # new vs original OMP
+& $py scripts\profile_allocator.py               # allocator stage timings
 ```
 
 Checkpoints are gitignored; refit them on each machine, and refit after

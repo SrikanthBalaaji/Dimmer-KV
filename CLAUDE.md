@@ -406,3 +406,34 @@ Remaining OMP time is the FP16 atom search, memory-bound at ~1.3 ms/step
 help. At 3K tokens: prefill 1.0 s, allocate 2.6 s (OMP 2.1 s, rest 0.45 s).
 4K prefill measured 7.5 s on the 8 GB card (eager attention memory pressure),
 not a reliable number. Allocation is still ~1.4-2.5x prefill time.
+
+## Progress log (2026-10-24, ~9:00 PM IST): full suite with the new OMP
+
+`scripts/compare_omp.py` (32 layer/streams x 8,176 held-out vectors):
+97.7% of atom slots identical to `omp_reference`; stored-code error
+identical to 4 decimals at 4/8/16 atoms; 2.02x faster (1,366 -> 675 ms).
+
+Full needle suite rerun (logs/suite_*_fastomp.log), 18 questions each.
+Correct (ans p), compress ms in brackets:
+
+| memory | config | question after compression | question in prompt |
+|---|---|---|---|
+| 10% | uniform lex3 | 0 (0.002) [230] | 1 (0.010) [215] |
+| | H2O / SnapKV eviction | 0 (0.002) [55] | 12 (0.381) [44] |
+| | dkv flat | 1 (0.010) [1313] | 4 (0.119) [1328] |
+| | dkv snap | - | 13 (0.482) [1375] |
+| 15% | uniform lex5 | 5 (0.028) [295] | 7 (0.104) [303] |
+| | H2O (sum) eviction | 0 (0.003) [21] | 1 (0.016) [23] |
+| | SnapKV eviction | - | 10 (0.404) [23] |
+| | dkv H2O sum | 1 (0.011) [1332] | - |
+| | dkv flat | 10 (0.262) [1284] | 13 (0.521) [1361] |
+| | dkv snap | - | 17 (0.909) [1382] |
+| 20-22% | uniform lex8 (22%) | 10 (0.289) [482] | 12 (0.453) [494] |
+| | H2O / SnapKV eviction | 0 (0.003) [22] | 13 (0.436) [23] |
+| | dkv flat | 14 (0.684) [1298] | 17 (0.852) [1368] |
+| | dkv snap | - | 17 (0.869) [1380] |
+
+Every result matches the old-OMP runs within 1 question (noise level).
+New: at 20% with the question in the prompt, flat and snap both reach 17/18
+(SnapKV eviction 13/18). Compression is ~1.3 s per 1.6K context for every
+allocator config (was ~2.4 s).
