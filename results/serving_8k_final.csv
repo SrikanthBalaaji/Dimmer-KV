@@ -1,0 +1,6 @@
+method,context_tokens,stored_mib,conversations_in_ram,prefill_ms,compress_ms,restore_ms,ttft_ms,decode_tokens_per_s,peak_extra_gpu_mib,needles,answer_p
+full (GPU-resident),8064,251.98,32,7433,0,1.9,42.2,38.7,613,21/24,0.7559
+"full (RAM, FP16)",8064,251.98,32,7433,0,14.5,48.0,46.5,613,21/24,0.7559
+recompute,8064,0.03,266321,7433,0,1240.4,1266.9,44.7,742,21/24,0.7559
+dkvtc@0.02:snap:floor1,8064,4.53,1806,7433,1487,267.5,310.0,46.7,1607,16/24,0.4321
+dkvtc@0.03:snap:floor1,8064,6.78,1209,7433,2479,387.2,437.3,46.7,1647,21/24,0.623

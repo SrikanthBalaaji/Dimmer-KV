@@ -79,14 +79,16 @@ def main() -> None:
 
     print("=== serving", flush=True)
     ways = ["full (GPU-resident)", "full (RAM, FP16)", "recompute"] + args.methods
-    stats = {w: {"bytes": 0, "ttft": 0.0, "restore": 0.0, "decode": 0.0, "peak": 0.0, "questions": 0} for w in ways}
+    stats = {w: {"bytes": 0, "ttft": 0.0, "restore": 0.0, "decode": 0.0, "peak": 0.0, "questions": 0, "compress": 0.0}
+             for w in ways}
     cases = build_cases(tokenizer, "after", args.seeds, args.context_tokens)
-    tokens_total = 0
+    tokens_total, prefill_total = 0, 0.0
     for context_ids, questions in cases:
         length = context_ids.shape[0]
         tokens_total += length
         with torch.inference_mode():
-            cache, scores = dimmer.prefill_with_scores(model, context_ids[None].to(device))
+            (cache, scores), prefill_ms = timed(lambda: dimmer.prefill_with_scores(model, context_ids[None].to(device)))
+            prefill_total += prefill_ms
             keys = [layer.keys.clone() for layer in cache.layers]
             values = [layer.values.clone() for layer in cache.layers]
             del cache
@@ -116,6 +118,7 @@ def main() -> None:
             stored["recompute"] = (length * 4, recompute)  # Only the token ids are kept.
             for name in args.methods:
                 compressed = methods.apply(name, keys, values, scores)
+                stats[name]["compress"] += compressed.seconds * 1000
                 if name.startswith("h2o"):
                     mask_bytes = config.layers * config.kv_heads * length // 8
                     payload = torch.empty(compressed.used_bytes + mask_bytes, dtype=torch.uint8)
@@ -176,6 +179,7 @@ def main() -> None:
         rows.append({
             "method": way, "context_tokens": round(tokens_total / len(cases)),
             "stored_mib": round(per_conv / MIB, 2), "conversations_in_ram": int(ram // per_conv),
+            "prefill_ms": round(prefill_total / len(cases)), "compress_ms": round(entry["compress"] / len(cases)),
             "restore_ms": round(entry["restore"] / entry["questions"], 1),
             "ttft_ms": round(entry["ttft"] / entry["questions"], 1),
             "decode_tokens_per_s": round(args.gen_tokens * entry["questions"] / (entry["decode"] / 1000), 1),

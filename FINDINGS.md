@@ -34,6 +34,7 @@ question is asked; plus perplexity, timing, and real storage size.
 | 16 | Attention directly over the compressed cache (keys per layer, values never decoded) | Same answers 60/60; GPU memory while answering 253 MB → 18–31 MB at 2%, ~0.9× speed |
 | 17 | RULER-style variable tracking (8K) and key-value retrieval (4K) | Variable tracking: DimmerKV question-aware 0.92 vs kvtc 0.82 (full 0.96); key-value: kvtc 0.65–0.70 beats DimmerKV 0.35–0.55; eviction collapses on both |
 | 18 | Precision floor at kvtc's step + question scores | Ties kvtc on key-value retrieval (0.65 vs 0.70/0.65), keeps the variable-tracking lead (0.90–0.91 vs 0.81–0.82) |
+| 19 | Final setting vs uncompressed cache, 8K tokens | 3%: 21/24 like the full cache, 37× smaller, 38× more conversations per 8 GiB, first token 0.44 s (recompute 1.27 s, RAM copy 0.05 s); direct mode peak GPU 7× lower |
 
 **Headline comparison** (8K-token conversations, 24 questions):
 
@@ -897,6 +898,57 @@ Variable tracking 8K, 3% with the same floor:
 - `scripts/demo_backup.py` writes `docs/demo_backup.html`: the demo's three
   scenarios and leaderboard recorded from the live model, for use if the
   live demo cannot run.
+
+## 16. Final setting vs the uncompressed cache: time and memory (8K tokens)
+
+Final setting `dkvtc@b:snap:floor1`, Llama-3.2-1B, RTX 5060 laptop, ~8K-token
+conversations, 24 questions asked after compression (12 for the direct-mode
+test). Raw rows: `results/serving_8k_final.csv`, `results/grid_1b_ctx8000_final.csv`,
+`logs/compressed_attention_8k_final.log`.
+
+| | full cache kept on GPU | full cache in RAM | recompute from text | **final 2%** | **final 3%** |
+|---|---|---|---|---|---|
+| stored per conversation | 252 MiB (GPU) | 252 MiB | ~0 | **4.5 MiB (56×)** | **6.8 MiB (37×)** |
+| conversations in 8 GiB RAM | — | 32 | unlimited | **1,806** | **1,209** |
+| compress (once) | — | — | — | 1.5 s | 2.5 s |
+| restore | 2 ms | 15 ms | 1,240 ms | 268 ms | 387 ms |
+| time to first token | 42 ms | 48 ms | 1,267 ms | 310 ms | 437 ms |
+| generation speed | 39–47 tok/s | 47 tok/s | 45 tok/s | 47 tok/s | 47 tok/s |
+| peak extra GPU memory while answering (rebuilt cache) | 613 MiB | 613 MiB | 742 MiB | 1,607 MiB | 1,647 MiB |
+| correct / ans p | 21/24 / .76 | 21/24 / .76 | 21/24 / .76 | 16/24 / .43 | **21/24 / .62** |
+
+Answering directly over the codes (12 questions, same replies as the rebuilt
+cache 12/12 at both budgets):
+
+| | rebuilt cache | direct, final 2% | direct, final 3% |
+|---|---|---|---|
+| GPU memory held for the conversation | 253 MiB | 181 MiB | **41 MiB (6×)** |
+| peak extra GPU memory | 506 MiB | **72 MiB (7×)** | **70 MiB (7×)** |
+| generation speed | 46 tok/s | 22 tok/s | 29 tok/s |
+
+Needle test, same contexts, question after compression (correct / ans p;
+full 21/24 / .756): kvtc 17/24 / .500 at 2% and 19/24 / .581 at 3%; final
+setting 16/24 / .432 and **21/24 / .623**; H2O and SnapKV 0/24 at both;
+progressive + refine top 1% 19/24 / .673 and 20/24 / .688.
+
+- **At 3% the final setting keeps the full cache's answer count (21/24) in
+  37× less storage**, 38× more conversations per 8 GiB, with first token in
+  0.44 s, 2.9× faster than re-reading the conversation (1.27 s) but slower
+  than copying an uncompressed cache from RAM (48 ms). Confidence is lower
+  than the full cache (.62 vs .76). Generation speed is unchanged.
+- **At 2% the floor cannot act** (kvtc only affords its coarsest step there),
+  so the setting equals plain question scores and is below kvtc (16 vs 17/24).
+  Without the question, refinement is the better 2% option (19/24).
+- **The rebuild path costs GPU memory**: decoding needs ~1.6 GiB of temporary
+  space vs 0.6 GiB for the full cache. Answering directly over the codes fixes
+  this (peak 70 MiB, 7× less) at about half the generation speed here.
+- **Direct mode at 2% held 181 MiB**, far above the 18–31 MB measured for
+  plain DimmerKV in section 13: the floor + question-score mix spreads tokens
+  over many precision steps, and our block merging then stores rare wide
+  blocks at full width. To fix: merge blocks by bytes, not by count.
+- Laptop timings at 8K are under GPU memory pressure: the scoring prefill
+  (eager attention) took 7.4 s per conversation (SDPA recompute: 1.2 s), and
+  compression 1.5–2.5 s vs ~0.35 s at 3K tokens.
 
 ## Caveats
 
