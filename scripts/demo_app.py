@@ -141,40 +141,59 @@ def run_method(label: str, budget: float, head_ids, tail_ids, keys, values, scor
     }
 
 
+def _fmt_ms(ms) -> str:
+    return "—" if ms is None else f"{ms:,.0f} ms"
+
+
 def card(label: str, result: dict, expected: str | None) -> str:
-    verdict = ""
-    if expected:
-        verdict = "✅ correct" if expected in result["reply"] else f"❌ wrong (expected {expected})"
-    stored_mb = result["stored"] / 2**20
+    """One method's result as an HTML card: answer, verdict, two headline numbers, details."""
+    if expected is None:
+        pill = '<span class="dk-pill">no answer check</span>'
+    elif expected in result["reply"]:
+        pill = '<span class="dk-pill ok">Correct</span>'
+    else:
+        pill = f'<span class="dk-pill bad">Wrong · expected {html.escape(expected)}</span>'
     ratio = result["full"] / max(result["stored"], 1)
     per_ram = int(RAM_GIB * 2**30 // max(result["stored"], 1))
-    lines = [
-        f"### {label}",
-        f"**Answer:** `{result['reply'] or '(empty)'}` {verdict}",
-        "",
-        "| | |",
-        "|---|---|",
-        f"| Stored size | **{stored_mb:.2f} MB** of {result['full'] / 2**20:.1f} MB (**{ratio:.0f}× smaller**) |",
-        f"| Conversations in {RAM_GIB} GiB of RAM | {per_ram:,} |",
-        f"| Compress time | {result['compress_ms']:.0f} ms |",
+    held = result["gpu_held"] / 2**20
+    gpu_ratio = result["full"] / max(result["gpu_held"], 1)
+    rows = [
+        ("Stored", f'{result["stored"] / 2**20:.2f} MB of {result["full"] / 2**20:.1f} MB'),
+        (f"Conversations in {RAM_GIB} GiB RAM", f"{per_ram:,}"),
+        ("GPU memory while answering", f"{held:.1f} MB · {html.escape(result['path'])}"),
+        ("Compress", _fmt_ms(result["compress_ms"])),
     ]
     if result["restore_ms"] is not None:
-        lines.append(f"| Restore from bytes | {result['restore_ms']:.0f} ms |")
+        rows.append(("Restore from bytes", _fmt_ms(result["restore_ms"])))
     if result["refine_ms"] is not None:
-        lines.append(f"| Question-time refinement | fetched {result['fetched'] / 2**20:.2f} MB "
-                     f"in {result['refine_ms']:.0f} ms |")
-    held = result["gpu_held"] / 2**20
-    note = "" if result["gpu_held"] >= result["full"] else f" (**{result['full'] / result['gpu_held']:.0f}× less**)"
-    lines.append(f"| GPU memory for this conversation while answering | **{held:.1f} MB**{note} · "
-                 f"{result['path']} |")
-    lines.append(f"| Answer time | {result['answer_ms']:.0f} ms |")
-    return "\n".join(lines)
+        rows.append(("Question-time refinement",
+                     f'{result["fetched"] / 2**20:.2f} MB in {_fmt_ms(result["refine_ms"])}'))
+    rows.append(("Answer", _fmt_ms(result["answer_ms"])))
+    details = "".join(f"<dt>{k}</dt><dd>{v}</dd>" for k, v in rows)
+    gpu_stat = (f'<div><b>{gpu_ratio:.0f}×</b><span>less GPU memory while answering</span></div>'
+                if gpu_ratio >= 1.5 else
+                f'<div><b>{held:.0f} MB</b><span>GPU memory while answering</span></div>')
+    return f"""<div class="dk-card">
+  <div class="dk-card-head"><span class="dk-method">{html.escape(label)}</span>{pill}</div>
+  <div class="dk-answer">{html.escape(result["reply"] or "(empty)")}</div>
+  <div class="dk-stats"><div><b>{ratio:.0f}×</b><span>smaller than the FP16 cache</span></div>{gpu_stat}</div>
+  {token_summary(result["token_bytes"])}
+  <dl class="dk-details">{details}</dl>
+</div>"""
+
+
+def error_card(label: str, error: Exception) -> str:
+    return f"""<div class="dk-card">
+  <div class="dk-card-head"><span class="dk-method">{html.escape(label)}</span><span class="dk-pill warn">Budget too small</span></div>
+  <p class="dk-note">{html.escape(str(error))}</p>
+  <p class="dk-note">kvtc needs about 2.8% at 3K tokens. Raise the budget or use DimmerKV + eviction.</p>
+</div>"""
 
 
 def heat_map(head_ids, token_bytes: torch.Tensor | None, highlight: str | None) -> str:
     """Tokens shaded by stored bytes on a log scale (dark = dropped, bright = exact)."""
     if token_bytes is None:
-        return "<p>No per-token data for this method.</p>"
+        return '<p class="dk-note">No per-token data for this method.</p>'
     full = 2.0 * config.layers * config.kv_heads * config.head_dim * 2
     values = token_bytes.float().cpu().tolist()
     pieces = [tokenizer.decode([int(t)]) for t in head_ids]
@@ -191,7 +210,7 @@ def heat_map(head_ids, token_bytes: torch.Tensor | None, highlight: str | None) 
     out = []
     for i, (piece, size) in enumerate(zip(pieces, values)):
         if size <= 0:
-            style = "background:#1f2328;color:#8b949e;"
+            style = "background:#24272d;color:#8b949e;"
         else:
             level = max(0.0, min(1.0, (math.log10(size / full) + 2) / 2))  # 1% -> 0, 100% -> 1
             light = 18 + 62 * level
@@ -199,32 +218,36 @@ def heat_map(head_ids, token_bytes: torch.Tensor | None, highlight: str | None) 
         if i in marked:
             style += "outline:2px solid #e5484d;font-weight:700;"
         out.append(f'<span title="{size:.0f} B" style="{style}">{html.escape(piece)}</span>')
-    legend = ('<p style="font-size:0.85em">Shading = bytes kept per token (log scale): '
-              '<span style="background:#1f2328;color:#8b949e;padding:0 4px">dropped</span> '
-              '<span style="background:hsl(45,95%,18%);color:#f0f0f0;padding:0 4px">~1% of FP16</span> '
-              '<span style="background:hsl(45,95%,49%);color:#111;padding:0 4px">~10%</span> '
-              '<span style="background:hsl(45,95%,80%);color:#111;padding:0 4px">exact</span> '
-              '· <span style="outline:2px solid #e5484d;padding:0 4px">answer</span></p>')
-    return legend + ('<div style="max-height:420px;overflow-y:auto;line-height:1.7;font-family:ui-monospace,'
-                     'monospace;font-size:12px;white-space:pre-wrap;word-break:break-word">'
-                     + "".join(out) + "</div>")
+    legend = ('<div class="dk-legend"><span>Bytes kept per token, log scale</span>'
+              '<i style="background:#24272d"></i>dropped'
+              '<i style="background:hsl(45,95%,18%)"></i>~1%'
+              '<i style="background:hsl(45,95%,49%)"></i>~10%'
+              '<i style="background:hsl(45,95%,80%)"></i>exact'
+              '<i style="outline:2px solid #e5484d;background:transparent"></i>answer</div>')
+    return legend + '<div class="dk-heat">' + "".join(out) + "</div>"
 
 
 def token_summary(token_bytes: torch.Tensor | None) -> str:
-    """One line: how the method treated the document's tokens."""
+    """A stacked bar: share of the document's tokens at each precision."""
     if token_bytes is None:
         return ""
     full = 2.0 * config.layers * config.kv_heads * config.head_dim * 2
     share = (token_bytes.float() / full).cpu()
-    groups = {
-        "dropped": share <= 0,
-        "coarse (<3% of FP16)": (share > 0) & (share < 0.03),
-        "medium (3–20%)": (share >= 0.03) & (share < 0.2),
-        "fine (20–99%)": (share >= 0.2) & (share < 0.99),
-        "exact": share >= 0.99,
-    }
-    parts = [f"{name} {float(mask.float().mean()):.0%}" for name, mask in groups.items() if bool(mask.any())]
-    return "**Tokens:** " + " · ".join(parts)
+    groups = [
+        ("dropped", share <= 0, "#24272d"),
+        ("coarse", (share > 0) & (share < 0.03), "hsl(45,95%,26%)"),
+        ("medium", (share >= 0.03) & (share < 0.2), "hsl(45,95%,45%)"),
+        ("fine", (share >= 0.2) & (share < 0.99), "hsl(45,95%,64%)"),
+        ("exact", share >= 0.99, "hsl(45,95%,82%)"),
+    ]
+    bar, keys = [], []
+    for name, mask, color in groups:
+        fraction = float(mask.float().mean())
+        if fraction <= 0:
+            continue
+        bar.append(f'<span style="width:{fraction * 100:.2f}%;background:{color}" title="{name} {fraction:.0%}"></span>')
+        keys.append(f'<span><i style="background:{color}"></i>{name} {fraction:.0%}</span>')
+    return f'<div class="dk-mix"><div class="dk-bar">{"".join(bar)}</div><div class="dk-keys">{"".join(keys)}</div></div>'
 
 
 def resolve_question(sample: int, question_choice: str, custom_question: str):
@@ -237,10 +260,14 @@ def resolve_question(sample: int, question_choice: str, custom_question: str):
 
 
 def document_header(head_ids, prefill_ms: float, in_prompt: bool) -> str:
-    when = "known before compression" if in_prompt else "asked after compression"
-    return (f"**Document:** {head_ids.shape[0]:,} tokens · full KV cache "
-            f"{head_ids.shape[0] * config.fp16_bytes_per_token() / 2**20:.1f} MB · re-reading it (prefill) "
-            f"took {prefill_ms:.0f} ms · question {when}")
+    tokens = head_ids.shape[0]
+    chips = [
+        ("Document", f"{tokens:,} tokens"),
+        ("Full KV cache", f"{tokens * config.fp16_bytes_per_token() / 2**20:.1f} MB"),
+        ("Prefill", f"{prefill_ms:,.0f} ms"),
+        ("Question", "known before compression" if in_prompt else "asked after compression"),
+    ]
+    return '<div class="dk-chips">' + "".join(f"<div><span>{k}</span><b>{v}</b></div>" for k, v in chips) + "</div>"
 
 
 def run(sample: int, question_choice: str, custom_question: str, in_prompt: bool, budget_percent: float,
@@ -252,11 +279,9 @@ def run(sample: int, question_choice: str, custom_question: str, in_prompt: bool
     for label in (left, right):
         try:
             result = run_method(label, budget, head_ids, tail_ids, keys, values, scores, direct)
-            outputs.append((card(label, result, expected) + "\n\n" + token_summary(result["token_bytes"]),
-                            heat_map(head_ids, result["token_bytes"], expected)))
+            outputs.append((card(label, result, expected), heat_map(head_ids, result["token_bytes"], expected)))
         except (ValueError, AssertionError) as error:
-            outputs.append((f"### {label}\n\n⚠️ {error}\n\n(kvtc needs ≥ ~2.8% at 3K tokens; "
-                            "use DimmerKV + eviction or a larger budget.)", ""))
+            outputs.append((error_card(label, error), ""))
     return (document_header(head_ids, prefill_ms, in_prompt),
             outputs[0][0], outputs[1][0], outputs[0][1], outputs[1][1])
 
@@ -280,7 +305,7 @@ def run_all(sample: int, question_choice: str, custom_question: str, in_prompt: 
                          "× smaller": None, per_ram: None, "GPU MB while answering": None, "Compress ms": None,
                          "Restore / refine ms": None})
             continue
-        correct = ("✅" if expected in r["reply"] else "❌") if expected else "?"
+        correct = ("Yes" if expected in r["reply"] else "No") if expected else "?"
         extra = r["restore_ms"] if r["restore_ms"] is not None else r["refine_ms"]
         rows.append({
             "Method": short, "Answer": r["reply"][:24], "Correct": correct,
@@ -328,7 +353,8 @@ def architecture_svg() -> str:
         match = None
     if not match:
         return "<p>Architecture diagram: see docs/DimmerKV_overview.html.</p>"
-    return f'<div style="background:#fbfaf7;border-radius:12px;padding:8px;overflow-x:auto">{match.group(0)}</div>'
+    return ('<div style="background:#fbfaf7;border:1px solid #e4e1da;border-radius:14px;padding:12px;'
+            f'overflow-x:auto">{match.group(0)}</div>')
 
 
 HOW_IT_WORKS = """
@@ -383,49 +409,139 @@ RESULTS = """
 **Perplexity, 3B, 8K tokens** (full 8.33): H2O 10.64 · SnapKV 10.25 · kvtc 8.48 · DimmerKV + question
 scores 8.46 (2% budget).
 
-Savings are in storage and transfer; during answering the model uses a normal FP16 cache.
+Savings are in storage and transfer; with direct mode on, the GPU also holds only the codes while answering.
 Details: `FINDINGS.md`, `docs/DimmerKV_overview.html`.
 """
 
+THEME = gr.themes.Base(
+    primary_hue=gr.themes.colors.amber,
+    neutral_hue=gr.themes.colors.stone,
+    radius_size=gr.themes.sizes.radius_md,
+    font=["Inter", "ui-sans-serif", "system-ui", "Segoe UI", "sans-serif"],
+    font_mono=["JetBrains Mono", "ui-monospace", "Consolas", "monospace"],
+).set(
+    body_background_fill="#f7f6f3",
+    body_background_fill_dark="#111214",
+    block_background_fill="#ffffff",
+    block_background_fill_dark="#18191c",
+    block_border_width="1px",
+    block_shadow="none",
+    block_label_text_size="*text_sm",
+    button_primary_background_fill="#1d1c1a",
+    button_primary_background_fill_hover="#3a3834",
+    button_primary_text_color="#ffffff",
+    button_primary_background_fill_dark="#e3a548",
+    button_primary_background_fill_hover_dark="#efb965",
+    button_primary_text_color_dark="#111214",
+    slider_color="#b7791f",
+    slider_color_dark="#e3a548",
+)
+
+CSS = """
+.gradio-container { max-width: 1280px !important; margin: 0 auto !important; }
+footer { display: none !important; }
+.dk-top { display:flex; align-items:baseline; justify-content:space-between; gap:16px; flex-wrap:wrap;
+          padding: 8px 2px 4px; }
+.dk-top h1 { font-size: 30px; font-weight: 700; letter-spacing: -0.02em; margin: 0; }
+.dk-top h1 em { font-style: normal; color: #b7791f; }
+.dk-top p { margin: 4px 0 0; color: var(--body-text-color-subdued); font-size: 15px; }
+.dk-top .dk-env { font-size: 13px; color: var(--body-text-color-subdued); font-family: var(--font-mono); }
+.dk-section { font-size: 12px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase;
+              color: var(--body-text-color-subdued); margin: 18px 2px 6px; }
+button.dk-scenario, .dk-scenario button { justify-content: flex-start !important; text-align: left !important;
+                      font-weight: 500 !important; border: 1px solid var(--border-color-primary) !important;
+                      background: var(--block-background-fill) !important; min-height: 52px; padding: 0 16px !important; }
+button.dk-scenario:hover, .dk-scenario button:hover { border-color: #b7791f !important; }
+.dk-chips { display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
+.dk-chips div { border: 1px solid var(--border-color-primary); border-radius: 10px; padding: 10px 14px;
+                background: var(--block-background-fill); }
+.dk-chips span { display:block; font-size: 12px; color: var(--body-text-color-subdued); }
+.dk-chips b { font-size: 16px; font-weight: 600; }
+.dk-card { border: 1px solid var(--border-color-primary); border-radius: 14px; padding: 18px 20px;
+           background: var(--block-background-fill); display:flex; flex-direction:column; gap: 14px; height: 100%; }
+.dk-card-head { display:flex; justify-content:space-between; align-items:center; gap: 10px; flex-wrap: wrap; }
+.dk-method { font-weight: 600; font-size: 15px; }
+.dk-pill { font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 999px;
+           background: rgba(127,127,127,.14); color: var(--body-text-color-subdued); white-space: nowrap; }
+.dk-pill.ok { background: rgba(48,164,108,.14); color: #2f9e67; }
+.dk-pill.bad { background: rgba(229,72,77,.13); color: #e5484d; }
+.dk-pill.warn { background: rgba(183,121,31,.15); color: #b7791f; }
+.dk-answer { font-family: var(--font-mono); font-size: 14px; padding: 10px 12px; border-radius: 8px;
+             background: rgba(127,127,127,.08); word-break: break-word; }
+.dk-stats { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.dk-stats b { display:block; font-size: 34px; font-weight: 700; letter-spacing: -0.02em; line-height: 1.1; }
+.dk-stats span { font-size: 12px; color: var(--body-text-color-subdued); }
+.dk-mix .dk-bar { display:flex; height: 10px; border-radius: 5px; overflow: hidden; background: rgba(127,127,127,.12); }
+.dk-mix .dk-bar span { display:block; height: 100%; }
+.dk-keys { display:flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 8px; font-size: 12px;
+           color: var(--body-text-color-subdued); }
+.dk-keys i, .dk-legend i { display:inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px;
+                           vertical-align: -1px; }
+.dk-details { display:grid; grid-template-columns: auto 1fr; gap: 6px 16px; margin: 0; font-size: 13px;
+              border-top: 1px solid var(--border-color-primary); padding-top: 12px; }
+.dk-details dt { color: var(--body-text-color-subdued); }
+.dk-details dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+.dk-note { color: var(--body-text-color-subdued); font-size: 14px; margin: 0; }
+.dk-legend { display:flex; flex-wrap: wrap; align-items:center; gap: 4px 12px; font-size: 12px;
+             color: var(--body-text-color-subdued); margin-bottom: 8px; }
+.dk-legend span { font-weight: 600; margin-right: 4px; }
+.dk-heat { max-height: 380px; overflow-y: auto; line-height: 1.75; font-family: var(--font-mono); font-size: 12px;
+           white-space: pre-wrap; word-break: break-word; border: 1px solid var(--border-color-primary);
+           border-radius: 10px; padding: 12px; }
+.dk-heat span { border-radius: 2px; }
+.dk-prose { max-width: 920px; }
+.dk-prose table { font-size: 14px; }
+"""
+
+TOP = f"""<div class="dk-top">
+  <div><h1>Dimmer<em>KV</em></h1>
+  <p>Compress a document's KV cache to a few percent, then ask about a fact hidden in it.</p></div>
+  <div class="dk-env">{DEFAULT_MODEL.split("/")[-1]} · {torch.cuda.get_device_name(0) if torch.cuda.is_available() else device}</div>
+</div>"""
+
 with gr.Blocks(title="DimmerKV") as demo:
-    gr.Markdown("# DimmerKV: dim the KV cache instead of deleting it\n"
-                "Compress a document's memory (KV cache) to a few percent, then ask about a fact hidden in it.")
+    gr.HTML(TOP)
     with gr.Tab("Compress & ask"):
-        gr.Markdown("**Quick scenarios** (set the controls and run):")
+        gr.HTML('<div class="dk-section">Scenarios</div>')
+        with gr.Row(equal_height=True):
+            scenario_buttons = [gr.Button(name, elem_classes="dk-scenario") for name in SCENARIOS]
+        gr.HTML('<div class="dk-section">Setup</div>')
+        with gr.Group():
+            with gr.Row():
+                sample = gr.Dropdown(choices=list(range(10)), value=0, scale=1,
+                                     label="Document (WikiText + 6 hidden facts)")
+                first_qa = sample_document(0)[1]
+                question = gr.Dropdown(choices=[q for q, _ in first_qa], value=first_qa[0][0], scale=2,
+                                       label="Question")
+                custom = gr.Textbox(label="Or your own question (no answer check)", placeholder="Optional", scale=2)
+            with gr.Row():
+                budget = gr.Slider(1.5, 20, value=4, step=0.5, scale=2, label="Memory budget, % of the FP16 cache")
+                in_prompt = gr.Checkbox(value=False, scale=1, label="Question known before compression")
+                direct = gr.Checkbox(value=True, scale=1, label="Answer directly from the compressed cache")
+            with gr.Row():
+                left = gr.Dropdown(list(METHODS), value="H2O (evict by attention)", label="Method A")
+                right = gr.Dropdown(list(METHODS), value="DimmerKV (per-token precision)", label="Method B")
         with gr.Row():
-            scenario_buttons = [gr.Button(name, size="sm") for name in SCENARIOS]
-        with gr.Row():
-            sample = gr.Dropdown(choices=list(range(10)), value=0, label="Sample document (WikiText + 6 hidden facts)")
-            first_qa = sample_document(0)[1]
-            question = gr.Dropdown(choices=[q for q, _ in first_qa], value=first_qa[0][0], label="Question")
-        custom = gr.Textbox(label="Or type your own question (no answer check)", placeholder="optional")
-        with gr.Row():
-            budget = gr.Slider(1.5, 20, value=4, step=0.5, label="Memory budget (% of the full FP16 cache)")
-            in_prompt = gr.Checkbox(value=False, label="Question known before compression (in the prompt)")
-            direct = gr.Checkbox(value=True, label="Answer directly from the compressed cache (no full decode)")
-        with gr.Row():
-            left = gr.Dropdown(list(METHODS), value="H2O (evict by attention)", label="Method A")
-            right = gr.Dropdown(list(METHODS), value="DimmerKV (per-token precision)", label="Method B")
-        with gr.Row():
-            go = gr.Button("Compress & answer (A vs B)", variant="primary")
-            go_all = gr.Button("Run all methods")
-        header = gr.Markdown()
-        with gr.Row():
-            card_a = gr.Markdown()
-            card_b = gr.Markdown()
-        with gr.Accordion("Per-token heat maps (bytes kept per token; red outline = the answer)", open=True):
+            go = gr.Button("Compress and answer", variant="primary", scale=3)
+            go_all = gr.Button("Run every method", scale=1)
+        gr.HTML('<div class="dk-section">Result</div>')
+        header = gr.HTML()
+        with gr.Row(equal_height=True):
+            card_a = gr.HTML()
+            card_b = gr.HTML()
+        with gr.Accordion("Per-token view: bytes kept for every token (red outline = the answer)", open=True):
             with gr.Row():
                 heat_a = gr.HTML()
                 heat_b = gr.HTML()
-        with gr.Accordion("All methods on this question", open=False) as all_box:
+        with gr.Accordion("Every method on this question", open=False) as all_box:
             board = gr.Dataframe(interactive=False, wrap=True)
-            chart = gr.BarPlot(x="Method", y="× smaller", color="Correct", title="How much smaller (× vs FP16)",
+            chart = gr.BarPlot(x="Method", y="× smaller", color="Correct", title="Size reduction vs FP16 (×)",
                                height=320)
     with gr.Tab("How it works"):
         gr.HTML(architecture_svg())
-        gr.Markdown(HOW_IT_WORKS)
+        gr.Markdown(HOW_IT_WORKS, elem_classes="dk-prose")
     with gr.Tab("Results"):
-        gr.Markdown(RESULTS)
+        gr.Markdown(RESULTS, elem_classes="dk-prose")
 
     sample.change(update_questions, sample, question)
     run_inputs = [sample, question, custom, in_prompt, budget, left, right, direct]
@@ -438,4 +554,4 @@ with gr.Blocks(title="DimmerKV") as demo:
         .then(lambda: gr.update(open=True), None, all_box)
 
 if __name__ == "__main__":
-    demo.launch(server_name="127.0.0.1", server_port=7860)
+    demo.launch(server_name="127.0.0.1", server_port=7860, theme=THEME, css=CSS)

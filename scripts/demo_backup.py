@@ -20,6 +20,8 @@ OUTPUT = Path(__file__).resolve().parent.parent / "docs" / "demo_backup.html"
 
 def card_html(markdown: str) -> str:
     """Render the demo's small markdown cards as HTML (headings, bold, code, two-column tables)."""
+    if markdown.lstrip().startswith("<"):
+        return markdown
     out, rows = [], []
 
     def inline(text: str) -> str:
