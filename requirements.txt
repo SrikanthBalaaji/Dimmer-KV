@@ -1,0 +1,9 @@
+# Install the PyTorch build for your GPU first: https://pytorch.org/get-started/locally/
+torch>=2.11
+transformers==5.20.2
+datasets>=5.1
+accelerate
+numpy
+pandas
+gradio>=6.30
+huggingface_hub

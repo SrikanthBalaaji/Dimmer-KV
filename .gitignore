@@ -27,3 +27,6 @@ Thumbs.db
 
 # Logs
 logs/
+
+# Papers (copyrighted; link to them instead of committing)
+*.pdf

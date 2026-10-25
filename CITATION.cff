@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+message: "If you use DimmerKV, please cite it as below."
+title: "DimmerKV: Per-Token Precision for KV Cache Compression in LLM Inference"
+type: software
+authors:
+  - given-names: Srikanth
+    family-names: Balaaji
+  - given-names: Sushanth
+    family-names: B
+  - given-names: T S Sathya
+    family-names: Kiran
+date-released: 2026-10-25
+repository-code: "https://github.com/SrikanthBalaaji/Dimmer-KV"
+url: "https://srikanthbalaaji.github.io/Dimmer-KV/"
+abstract: >-
+  DimmerKV compresses the KV cache of large language models to 2-5% of its
+  FP16 size by giving every token its own precision on top of kvtc-style
+  transform coding, refining the tokens a new question needs, and running
+  attention directly over the compressed cache. Unlike eviction (H2O,
+  SnapKV), it keeps facts that are asked about after compression.
+keywords:
+  - kv cache compression
+  - llm inference
+  - long context
+  - transformer
+  - quantization
+  - transform coding
+  - pytorch
+  - hugging face transformers
+  - llama

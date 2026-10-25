@@ -1,157 +1,156 @@
-# DimmerKV
+# DimmerKV: KV cache compression for LLM inference
 
-**Dim the KV cache instead of deleting it.** DimmerKV shrinks a language model's memory of what it has
-read (the KV cache) to 1.5–5% of its normal size while keeping the facts a later question needs. It
-keeps every token at a precision chosen for that token, and sharpens the right tokens when the
-question arrives.
+**Dim the KV cache instead of deleting it.** DimmerKV compresses a language model's KV cache to
+2–5% of its FP16 size (20–56× smaller) and still answers questions about the compressed text as well
+as the uncompressed cache. Instead of evicting tokens like H2O or SnapKV, it keeps **every token at a
+precision chosen for that token**, sharpens the tokens a new question needs, and can run attention
+directly over the compressed cache.
 
-Built at Hashcode 14.0 (Track 01, LLM Inference) by Team Deadoop: Srikanth Balaaji, Sushanth B,
-T S Sathya Kiran.
+[![Python 3.11](https://img.shields.io/badge/python-3.11-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.11%2B-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![Hugging Face Transformers](https://img.shields.io/badge/%F0%9F%A4%97%20Transformers-5.20-FFD21E)](https://github.com/huggingface/transformers)
+[![Models: Llama 3.2](https://img.shields.io/badge/models-Llama%203.2%201B%20%7C%203B-6E56CF)](https://huggingface.co/meta-llama)
+[![Hashcode 14.0](https://img.shields.io/badge/Hashcode%2014.0-Track%2001%20LLM%20Inference-2E7D4F)](#team)
+
+**Project page:** [srikanthbalaaji.github.io/Dimmer-KV](https://srikanthbalaaji.github.io/Dimmer-KV/) ·
+**Full write-up:** [`docs/DimmerKV_overview.html`](docs/DimmerKV_overview.html) ·
+**Every experiment:** [`FINDINGS.md`](FINDINGS.md)
 
 | | |
 |---|---|
-| **50–67× smaller** | cache that still matches the full cache on hidden-fact questions (question known, 8K tokens) |
-| **57× more conversations per GiB** | 3B model, 16K-token conversations, 18/18 answers correct |
-| **0 / 36** | answers that H2O-style eviction gets when the question comes after compression |
-| **2.3× faster** first answer token | than re-reading the conversation (3B, 16K tokens) |
-
-Full write-up with the architecture diagram: [`docs/DimmerKV_overview.html`](docs/DimmerKV_overview.html)
-(download and open in a browser). Every experiment and number: [`FINDINGS.md`](FINDINGS.md).
-Recorded demo scenarios (if the live demo cannot run): [`docs/demo_backup.html`](docs/demo_backup.html).
+| **37× smaller, full-cache accuracy** | 21/24 hidden facts recalled at 3% of FP16 KV memory, same as the uncompressed cache (Llama-3.2-1B, 8K tokens, question asked after compression) |
+| **57× more conversations per GiB** | Llama-3.2-3B, 16K-token conversations, 18/18 answers correct |
+| **0/36 for H2O** | Eviction deletes the facts a later question needs; DimmerKV keeps 36/36 at the same 2% budget (3B, 8K) |
+| **8–14× less GPU memory while answering** | Attention runs over the compressed cache; the full FP16 cache never exists (2% budget, same answers) |
 
 ---
 
-## The problem
+## Why
 
-For every token a model reads, it stores a key and a value vector in every layer and attention head.
-On Llama-3.2-3B that is about 112 KB per token, so a 16K-token conversation needs **1.75 GB**. A
-server that keeps conversations between turns runs out of memory fast, and rebuilding a conversation
-from its text means re-reading all of it.
+For every token an LLM reads, it stores a key and a value vector in every layer and attention head.
+On Llama-3.2-3B that is about 112 KB per token, so one 16K-token conversation needs **1.75 GB**.
+Servers that keep conversations between turns (chat assistants, agents, document Q&A, prefix
+caching as in Mooncake) run out of memory fast, and re-reading a conversation from text is slow.
 
-The usual fix is **eviction** (H2O, SnapKV): keep the tokens that got the most attention, delete the
-rest. That fails when the question comes *after* compression. Before the question exists, the facts
-it will need were never heavily attended. In our tests the hidden facts ranked at the 30–35th
-percentile of H2O's attention scores, so H2O deleted them and answered **0 of 36** questions on the 3B
-model, where the full cache answered 36 of 36.
+The usual fix is **KV cache eviction** (H2O, SnapKV): keep the tokens that received the most
+attention and delete the rest. That fails when the question comes **after** compression. Before the
+question exists, the facts it will need were never heavily attended: in our tests the hidden facts sat
+at the 30–35th percentile of H2O's attention scores, so H2O deleted them.
 
-## Our solution
+## How it works
 
-DimmerKV does not make a keep-or-delete decision. Every token keeps some precision ("brightness"),
-and a single byte budget is spent where it removes the most error.
+```mermaid
+flowchart LR
+    A[Document or conversation] --> B[Prefill<br/>Llama 3.2]
+    B --> C[FP16 KV cache]
+    C --> D[Transform<br/>undo RoPE, cross-layer PCA]
+    D --> E[DimmerKV allocator<br/>precision per token<br/>under one byte budget]
+    E --> F[Progressive bit-planes]
+    F --> G[(Hot tier<br/>first bit-planes)]
+    F --> H[(Cold tier<br/>remaining planes, DEFLATE)]
+    Q[New question] --> I[Score the coarse cache]
+    G --> I
+    I -- fetch top ~1% of tokens --> H
+    G --> J[Attention over the codes<br/>keys per layer, values never decoded]
+    H --> J
+    J --> K[Answer]
+```
 
-1. **Calibrate once per model** (kvtc-style). For each token, undo RoPE on the keys and join all layers
-   and heads into one vector (8,192 numbers on 1B, 28,672 on 3B), likewise the values. Fit one PCA
-   basis on ~100K WikiText tokens. Learn an order of (group of 64 components, bit-plane) pieces by
-   error removed per byte.
-2. **Compress once per conversation.** Quantize every token once at 8 bits per group. The
-   **DimmerKV allocator** measures each token's error at every precision step and hands out
-   upgrades greedily by error removed per byte, from "dropped" (0 bytes) through coarse to fine bit-planes.
-   - Without the question, tokens are weighted equally (**flat**): bytes go to tokens that are hard to compress.
-   - With the question in the prompt, errors are weighted by the **question's attention**, so relevant tokens get finer precision.
-   - **Recommended setting (`dkvtc@b:snap:floor1`)**: every token first gets kvtc's uniform precision (a
-     floor), and only the leftover bytes are spent by question score. This is never worse than kvtc on
-     the tasks we tested.
-   - The first 4 and last 32 tokens stay exact.
-3. **Store in tiers.** Bit-pack and DEFLATE. A **hot** tier holds each token's first bit-planes; a **cold**
-   tier holds the rest. Under memory pressure a conversation is demoted by dropping planes, with no
+1. **Calibrate once per model** (kvtc-style transform coding). Undo RoPE on the keys, join all layers
+   and heads into one vector per token, and fit one PCA basis on WikiText.
+2. **Compress once per conversation.** The DimmerKV allocator measures each token's error at every
+   precision step and spends one byte budget greedily by error removed per byte, from "dropped"
+   (0 bytes) up to fine bit-planes. Every token first gets kvtc's uniform precision (a floor); the
+   leftover bytes go to tokens the question attends to, when the question is known.
+3. **Store in tiers.** Bit-pack and DEFLATE. A hot tier holds each token's first bit-planes, a cold
+   tier the rest. Under memory pressure a conversation is demoted by dropping planes, with no
    re-encoding.
-4. **Restore and refine per question.** Decode only the PCA groups that carry bits and re-apply RoPE.
-   When the question arrives, score the restored cache with it and **fetch the full bit-planes for its
-   top ~1% of tokens**.
-5. **Answer, without rebuilding the cache.** Attention runs over the compressed tokens directly: keys are
-   rebuilt one layer at a time and discarded, values are never decoded (attention weights the small
-   coefficient vectors, then applies the basis once per head). Answers are identical to the
-   fully decoded cache, and GPU memory while answering drops 8–14× at a 2% budget.
+4. **Refine per question.** Score the coarse cache with the new question and fetch full precision
+   for its top ~1% of tokens (0.5% extra bytes).
+5. **Answer from the codes.** Keys are rebuilt one layer at a time and discarded; values stay in
+   coefficient space (attention weights the coefficients, then applies the basis once per head).
+   Answers match the fully decoded cache.
 
 ## What is new
 
 | | Eviction (H2O, SnapKV) | kvtc (ICLR 2026) | **DimmerKV** |
 |---|---|---|---|
 | Unit of decision | keep or delete a token | same precision for every token | **precision per token**, including 0 |
-| Importance signal | attention (before the question) | none | **error per byte**, plus the question's attention when known |
-| Question after compression | facts lost | uniform loss | **question-time refinement** fetches detail for the tokens the question needs |
-| Coding | none | fixed 0/2/4/8-bit allocation | **progressive bit-planes**: one encoding, any precision by truncation |
+| Importance signal | attention before the question | none | **error per byte**, plus the question's attention when known |
+| Question after compression | facts lost | uniform loss | **question-time refinement** fetches detail where the question looks |
+| Coding | none | fixed bit allocation | **progressive bit-planes**: one encoding, any precision by truncation |
 | Storage | single tier | single tier | **hot/cold tiers**, demote by dropping planes |
+| Answering | normal cache | decode, then normal cache | **attention directly over the compressed cache** |
 
-Specific contributions:
-- **Per-token precision on top of transform coding.** kvtc gives every token the same bits; DimmerKV
-  allocates bit-planes per token under one budget and beats kvtc at equal bytes.
-- **A precision floor at kvtc's level.** Per-token precision alone lost to kvtc on dense lookups where
-  every token matters equally; giving every token kvtc's precision first and spending only the leftover
-  by question score ties kvtc there and keeps the lead on multi-hop tracking.
-- **Eviction as a precision level.** A zero-byte level lets one allocator mix dropping and graded
-  precision. With question scores this matched the full cache at 1.5–2% of its memory.
-- **Progressive bit-plane coding.** Nested 8-bit codes ordered by error per byte are 10–30% more
-  accurate than kvtc's fixed bit ladder at the same size, and they make tiers and refinement possible.
-- **Question-time refinement** (score the coarse cache, then fetch detail for the top tokens). It fixes
-  most of the gap when the question comes after compression, for 0.5% extra bytes.
-- **Partial-basis decode.** Only PCA groups that carry bits are multiplied, so restoring is 4× faster
-  and beats re-reading the conversation.
-- **Attention in the compressed domain.** Keys decoded per layer on the fly and values used directly in
-  coefficient space, so the full FP16 cache never exists while answering.
+## Results at a glance
 
-## Performance
+Llama-3.2-1B on an RTX 5060 laptop GPU (8 GB). Every question is asked **after** compression, and
+every compressed method gets the same memory budget.
 
-Llama-3.2-1B on an RTX 5060 laptop (8 GB); Llama-3.2-3B on an AWS L40S. Budgets are the compressed
-size as a share of the FP16 KV cache (2% = 50× smaller). "ans p" is the model's average probability
-of the correct answer. The test hides facts such as *"The access code for the Orion locker is 7311"*
-in WikiText and asks about them.
+| Method | Memory per 8K-token chat | Facts asked later (needle, 3%) | Multi-hop tracking (RULER-style, 8K, 3%) | Exact lookup (RULER-style KV, 4K, 5%) | First answer token | GPU memory while answering |
+|---|---|---|---|---|---|---|
+| Full cache, uncompressed | 252 MiB | 21/24 | 0.96 | 0.65 | 48 ms | 253 MiB |
+| Recompute from text | 0 | 21/24 | 0.96 | 0.65 | 1,267 ms | 253 MiB |
+| H2O eviction | 3% | **0/24** | 0.11 | 0.00 | 35 ms | — |
+| SnapKV eviction | 3% | **0/24** | 0.01 | 0.00 | — | — |
+| kvtc transform coding | 3% | 19/24 | 0.81 | **0.70** | — | — |
+| **DimmerKV (final setting)** | **3%, 6.8 MiB (37×)** | **21/24** | **0.90** | 0.65 | 437 ms | **41 MiB** |
+| **DimmerKV progressive + refine** | 3% + 0.5% fetched | 20/24 | 0.88 | 0.55 | — | — |
 
-**Head to head: H2O alone, Lexico alone, DimmerKV** (1B, ~3.1K-token conversations, FP16 cache
-96 MiB, 24 questions asked after compression, RTX 5060 laptop; `results/memory_time_accuracy.csv`,
-`results/serving.csv`)
+Bigger model: on Llama-3.2-3B with 16K-token conversations (AWS L40S), DimmerKV at 2% answers
+**18/18** and fits **57× more conversations per GiB**; H2O at 2% answers 0/18. "—" means not
+measured in that setting.
+
+<details>
+<summary><b>Head to head on storage and speed: H2O, Lexico, DimmerKV</b> (1B, ~3.1K-token conversations)</summary>
 
 | method | stored per conversation | smaller by | conversations in 8 GiB RAM | compress | restore | first answer token | tokens/s | correct | perplexity |
 |---|---|---|---|---|---|---|---|---|---|
 | Full cache in RAM | 96.3 MiB | 1× | 85 | — | 5 ms | 25 ms | 64 | 24/24 | 11.32 |
-| Recompute from the text | ~0 | — | unlimited | — | 840 ms (prefill) | 891 ms | 61 | 24/24 | 11.32 |
+| Recompute from the text | ~0 | — | unlimited | — | 840 ms | 891 ms | 61 | 24/24 | 11.32 |
 | H2O 5% | 4.9 MiB | 20× | 1,685 | 28 ms | <1 ms\* | 22 ms | 58 | 0/24 | 12.72 |
 | H2O 10% | 9.7 MiB | 10× | 846 | 30 ms | <1 ms\* | 22 ms | 60 | 0/24 | 12.29 |
 | Lexico 10% (uniform) | 9.2 MiB† | 10× | ~890† | 362 ms | ~30–45 ms‡ | — | — | 0/24 | 13.90 |
 | **DimmerKV 3%** | **2.6 MiB** | **37×** | **3,127** | 348 ms | 154 ms | 176 ms | 61 | **23/24** | **11.58** |
 | **DimmerKV 5%** | 4.3 MiB | 22× | 1,896 | 360 ms | 166 ms | 188 ms | 64 | **24/24** | **11.45** |
 
-DimmerKV here is the question-unaware setting (`dkvtc@b`, sizes after bit-packing and DEFLATE).
-\* H2O's restore only copies its kept tokens; its cache layout is simulated, so this is a lower bound.
-† Lexico's size is counted from its codes (no byte format written); conversations computed from it.
-‡ Lexico decode time from the codec benchmark (9–15 ms per 1K tokens); Lexico was not in the serving
-benchmark, so it has no first-token or tokens/s figure.
+DimmerKV here is the question-unaware setting (`dkvtc@b`), sizes after bit-packing and DEFLATE.
+\* H2O's restore only copies its kept tokens (simulated layout, a lower bound). † Counted from
+Lexico's codes. ‡ From the codec benchmark. Sources: `results/memory_time_accuracy.csv`,
+`results/serving.csv`.
+</details>
 
-- **Speed: H2O is fastest.** It only drops tokens (about 30 ms to compress, 22 ms to the first token).
-  DimmerKV takes about 0.35 s to compress and 0.18 s to the first token, still about 5× faster than
-  re-reading the conversation. Lexico compresses at about the same speed as DimmerKV at this length,
-  but its sparse search (OMP) grows with the number of atoms (0.35–0.67 s per 1K tokens at 8–16 atoms).
-  Generation speed is the same for all methods (58–65 tokens/s), because answering here uses a normal
-  FP16 cache.
-- **Memory: DimmerKV is smallest and the only one that keeps the answers.** At 3% it stores less than
-  H2O at 5% or Lexico at 10%, fits 1.9× and 3.5× more conversations than them, answers 23/24 and stays
-  within 2.3% of full perplexity. H2O and Lexico answer 0/24 at these sizes. H2O failed at every budget
-  we tried up to 20% when the question comes later; uniform Lexico needed 22–27% of FP16 to answer
-  10–16 of 18 (1.6K tokens).
-- **GPU memory while answering** (8K tokens, 2%): H2O holds only its kept tokens (about 5 MiB);
-  DimmerKV answering directly over the codes holds 18–31 MB, against 253 MB for the full cache. H2O is
-  smaller here, but it has deleted the facts.
+<details>
+<summary><b>Final setting vs the uncompressed cache</b> (1B, 8K tokens, question after compression)</summary>
 
-**Question known before compression** (8K-token documents)
+| | full cache on GPU | full cache in RAM | recompute | **final 2%** | **final 3%** |
+|---|---|---|---|---|---|
+| stored per conversation | 252 MiB | 252 MiB | ~0 | 4.5 MiB (56×) | **6.8 MiB (37×)** |
+| conversations in 8 GiB RAM | — | 32 | unlimited | 1,806 | **1,209** |
+| compress (once) | — | — | — | 1.5 s | 2.5 s |
+| time to first token | 42 ms | 48 ms | 1,267 ms | 310 ms | 437 ms |
+| generation speed | 39–47 tok/s | 47 tok/s | 45 tok/s | 47 tok/s | 47 tok/s |
+| correct / answer probability | 21/24 / .76 | 21/24 / .76 | 21/24 / .76 | 16/24 / .43 | **21/24 / .62** |
+
+Answering directly over the codes at 3%: 41 MiB held per conversation instead of 253 MiB, peak extra
+GPU memory 70 MiB instead of 506 MiB, at 29 instead of 46 tokens/s. Source: `results/serving_8k_final.csv`,
+`results/grid_1b_ctx8000_final.csv`.
+</details>
+
+<details>
+<summary><b>Question known before compression</b> (8K-token documents)</summary>
 
 | method | 1B, 1.5% | 1B, 2% | 3B, 2% |
 |---|---|---|---|
 | Full cache (100%) | 21/24 | 21/24 | 36/36 · .992 |
 | SnapKV (evict by question attention) | 6/24 | 10/24 | 34/36 · .913 |
 | kvtc (same precision for all) | — | 17/24 | 35/36 · .978 |
-| **DimmerKV, question scores (+ eviction on 1B)** | **21/24** | **22/24** | **36/36 · .986** |
+| **DimmerKV, question scores (+ eviction level on 1B)** | **21/24** | **22/24** | **36/36 · .986** |
 | **DimmerKV progressive + refinement** | — | — | **36/36 · .992** |
+</details>
 
-**Question asked after compression** (8K-token documents)
-
-| method | 1B, 2% | 3B, 2% |
-|---|---|---|
-| Full cache | 21/24 · .75 | 36/36 · .99 |
-| H2O | 0/24 · .00 | 0/36 · .00 |
-| kvtc | 17/24 · .51 | 36/36 · .99 |
-| **DimmerKV progressive, refine top 1% (+0.5% fetched)** | **19/24 · .71** | **36/36 · .99** |
-
-**Serving: 3B model, 16K-token conversations, 18 questions**
+<details>
+<summary><b>Serving: 3B model, 16K-token conversations</b></summary>
 
 | how a conversation is kept | stored | conversations in 8 GiB RAM | first answer token | correct |
 |---|---|---|---|---|
@@ -159,11 +158,10 @@ benchmark, so it has no first-token or tokens/s figure.
 | Re-read the text (chunked SDPA prefill) | ~0 | unlimited | 1,434 ms | 18/18 |
 | H2O, 2% | 35 MiB | 230 | 61 ms | **0/18** |
 | **kvtc / DimmerKV, 2%** | **31 MiB** | **263 (57×)** | **488–627 ms** | **18/18** |
+</details>
 
-Generation speed is the same for every method (about 26 tokens/s on 3B, 46 on 1B) when the cache is
-rebuilt before answering.
-
-**Answering directly from the compressed cache** (1B, 8K tokens, 12 questions per method)
+<details>
+<summary><b>Answering directly from the compressed cache</b> (1B, 8K tokens)</summary>
 
 | method | same answers as rebuilt cache | GPU memory held per conversation | tokens/s (rebuilt → direct) |
 |---|---|---|---|
@@ -171,8 +169,12 @@ rebuilt before answering.
 | DimmerKV 2% | 12/12 | 253 MB → **22 MB** | 45 → 39 |
 | DimmerKV + question scores + eviction 2% | 12/12 | 253 MB → **31 MB** | 31 → 31 |
 | kvtc 5% | 12/12 | 253 MB → 55 MB | 43 → 29 |
+</details>
 
-**RULER-style tasks (1B, 20 samples per cell)**: the two long-context tasks the kvtc paper reports
+<details>
+<summary><b>RULER-style long-context tasks and perplexity</b></summary>
+
+1B, 20 samples per cell:
 
 | method | variable tracking 8K, 3%, question in prompt | variable tracking 8K, 2%, question later | key-value retrieval 4K, 5%, question later |
 |---|---|---|---|
@@ -184,12 +186,7 @@ rebuilt before answering.
 | DimmerKV progressive + refine top 1% | 0.87 | **0.87** | 0.55 |
 | **DimmerKV + question scores + floor at kvtc's level** | 0.91 | **0.90** | **0.65** |
 
-DimmerKV wins where importance is uneven (multi-hop chains in filler). On a dense table of random
-UUIDs, where every token matters equally, plain per-token allocation lost to kvtc; giving every token
-kvtc's precision first and spending only the leftover by question score (`dkvtc@b:snap:floor1`)
-ties kvtc there while keeping the lead on variable tracking.
-
-**Perplexity: 3B, 8K tokens** (full cache 8.33; lower is better)
+Perplexity, 3B, 8K tokens (full cache 8.33, lower is better):
 
 | method | 2% | 3% | 5% |
 |---|---|---|---|
@@ -197,8 +194,10 @@ ties kvtc there while keeping the lead on variable tracking.
 | SnapKV | 10.25 | 9.92 | 9.51 |
 | kvtc | 8.48 | 8.42 | 8.34 |
 | **DimmerKV, question scores** | **8.46** | **8.37** | 8.35 |
+</details>
 
-**Improvements along the way** (same tests)
+<details>
+<summary><b>What each change bought</b></summary>
 
 | change | before | after |
 |---|---|---|
@@ -207,78 +206,107 @@ ties kvtc there while keeping the lead on variable tracking.
 | Progressive bit-planes vs kvtc's bit ladder (reconstruction error, 1B) | — | 10–30% lower at equal size |
 | Question-time refinement (1B, 8K, 2%, question later) | ans p .50 | ans p .71 (full .75) |
 | Question scores + eviction level (1B, 8K, 1.5%, question known) | SnapKV 6/24 | 21/24 (= full cache) |
-| Partial-basis decode (restore time, 1B 8K / 3B 16K, 2%) | 390 ms / 1,597 ms | 93 ms / 416 ms |
-| Faster OMP for Lexico (encode time) | 70 ms/stream | 33 ms/stream |
+| Partial-basis decode (restore, 1B 8K / 3B 16K, 2%) | 390 ms / 1,597 ms | 93 ms / 416 ms |
 | Attention over codes instead of a rebuilt cache (GPU memory while answering, 1B 8K, 2%) | 253 MB | 18–31 MB |
+</details>
 
-## Run it
+## Quickstart
 
-```powershell
-# Python 3.11, torch 2.11 (CUDA), transformers 5.20.2, datasets 5.1.0, gradio 6.30
-$py = "$env:USERPROFILE\.venvs\hashcode\Scripts\python.exe"
-# One-time calibration (checkpoints are not in git; refit per model)
-& $py scripts\fit_kvtc.py                # checkpoints\kvtc.pt (~1.3 min on 1B)
-& $py scripts\fit_progressive.py         # checkpoints\progressive.pt
-# Demo: http://127.0.0.1:7860
-& $py scripts\demo_app.py
-# Evaluations
-& $py scripts\test_generation.py --context-tokens 8000 --configs kvtcf@0.02 prog@0.02:r0.01 h2o:0.02
-& $py scripts\test_generation.py --mode prompt --context-tokens 8000 --configs h2o:0.02:snap dkvtc@0.02:snap:ev
-& $py scripts\eval_perplexity.py --configs kvtcf@0.03 dkvtc@0.03:snap h2o:0.03
-& $py scripts\bench_serving.py --context-tokens 8000 --methods h2o:0.02 kvtcf@0.02 dkvtc@0.02
-& $py scripts\eval_ruler.py --task vt --context-tokens 8000 --configs kvtcf@0.03 dkvtc@0.03:snap:ev h2o:0.03
-& $py scripts\eval_ruler.py --task kv --context-tokens 4000 --configs kvtcf@0.05 dkvtc@0.05:snap:floor1
-& $py scripts\test_compressed_attention.py --context-tokens 8000 --methods kvtcf@0.02 dkvtc@0.02
-& $py scripts\run_grid.py --model meta-llama/Llama-3.2-1B-Instruct --budgets 0.02 0.05 --templates "h2o:{b}" "kvtcf@{b}" "dkvtc@{b}"
+```bash
+git clone https://github.com/SrikanthBalaaji/Dimmer-KV.git
+cd Dimmer-KV
+python -m venv .venv
+source .venv/bin/activate            # Windows: .venv\Scripts\activate
+# Install the PyTorch build for your GPU first: https://pytorch.org/get-started/locally/
+pip install -r requirements.txt
+hf auth login                        # Llama 3.2 is gated on Hugging Face
+
+python scripts/fit_kvtc.py           # one-time calibration, ~1.3 min on 1B
+python scripts/fit_progressive.py    # progressive bit-plane order
+python scripts/demo_app.py           # Gradio demo at http://127.0.0.1:7860
 ```
 
-Method names (`h2o:0.02`, `kvtcf@0.03`, `dkvtc@0.02:snap:ev`, `prog@0.02:r0.01`, …) are documented at
-the top of [`scripts/methods.py`](scripts/methods.py).
+Tested on Windows (RTX 5060 laptop, 8 GB) with Llama-3.2-1B-Instruct and on Linux (AWS L40S) with
+Llama-3.2-3B-Instruct. Checkpoints are not in git; refit them per model.
+
+**Reproduce the main results**
+
+```bash
+# Question asked after compression: kvtc vs progressive refinement vs H2O
+python scripts/test_generation.py --context-tokens 8000 --configs kvtcf@0.02 prog@0.02:r0.01 h2o:0.02
+# Question in the prompt: SnapKV vs DimmerKV with question scores and an eviction level
+python scripts/test_generation.py --mode prompt --context-tokens 8000 --configs h2o:0.02:snap dkvtc@0.02:snap:ev
+# RULER-style tasks with the recommended setting
+python scripts/eval_ruler.py --task vt --context-tokens 8000 --configs kvtcf@0.03 dkvtc@0.03:snap:floor1 h2o:0.03
+python scripts/eval_ruler.py --task kv --context-tokens 4000 --configs kvtcf@0.05 dkvtc@0.05:snap:floor1
+# Perplexity, serving, and attention over the compressed cache
+python scripts/eval_perplexity.py --configs kvtcf@0.03 dkvtc@0.03:snap h2o:0.03
+python scripts/bench_serving.py --context-tokens 8000 --methods h2o:0.02 kvtcf@0.02 dkvtc@0.02
+python scripts/test_compressed_attention.py --context-tokens 8000 --methods kvtcf@0.02 dkvtc@0.02
+```
+
+Method names (`h2o:0.02`, `kvtcf@0.03`, `dkvtc@0.02:snap:floor1`, `prog@0.02:r0.01`, …) are
+documented at the top of [`scripts/methods.py`](scripts/methods.py). The recommended setting is
+`dkvtc@<budget>:snap:floor1`.
 
 ## Repository layout
 
 | path | what it is |
 |---|---|
-| `scripts/kvtc.py`, `fit_kvtc.py` | kvtc-style transform (RoPE removal, cross-layer PCA, grouped quantization), DimmerKV per-token allocation, eviction level |
+| `scripts/kvtc.py`, `fit_kvtc.py` | transform coding (RoPE removal, cross-layer PCA, grouped quantization), DimmerKV per-token allocation, eviction level |
 | `scripts/progressive.py`, `fit_progressive.py` | progressive bit-planes, hot/cold tiers, question-time refinement |
 | `scripts/kvtc_storage.py` | real byte storage (bit-packing, DEFLATE) and partial-basis restore |
-| `scripts/dimmer.py` | attention hook: H2O / question-window scores, per-head eviction masks, chunked prefill |
-| `scripts/compressed_attention.py` | attention directly over the compressed cache (keys per layer, values never decoded) |
+| `scripts/compressed_attention.py` | attention directly over the compressed cache |
+| `scripts/dimmer.py` | attention hook: H2O and question-window scores, eviction masks, chunked prefill |
 | `scripts/methods.py` | one name per method, shared by every script and the demo |
-| `scripts/test_generation.py`, `eval_perplexity.py`, `bench_serving.py`, `bench_memory.py`, `run_grid.py` | needle tests, perplexity, serving benchmark, storage/time benchmark, CSV grid runner |
-| `scripts/demo_app.py`, `demo_backup.py` | Gradio demo (scenarios, side-by-side result cards, all-methods leaderboard, per-token heat map) and its static backup |
-| `scripts/lexico.py`, `pca_codec.py`, … | earlier codecs, kept as ablations |
-| `docs/DimmerKV_overview.html` | overview page with the architecture diagram |
-| `FINDINGS.md`, `results/` | every experiment, and the raw result CSVs |
+| `scripts/test_generation.py`, `eval_ruler.py`, `eval_perplexity.py`, `bench_serving.py`, `run_grid.py` | needle tests, RULER-style tasks, perplexity, serving benchmark, CSV grid runner |
+| `scripts/demo_app.py`, `demo_backup.py` | Gradio demo and its static backup |
+| `scripts/lexico.py`, `pca_codec.py` | earlier codecs (Lexico sparse coding, per-head PCA), kept as ablations |
+| `docs/` | project page, overview with the architecture diagram, recorded demo |
+| `FINDINGS.md`, `results/` | every experiment, and the raw result files |
 
 ## Limits
 
-- **Answering directly from the compressed cache** works for the kvtc family and gives identical answers,
-  but costs speed at larger budgets (about 0.9× at 2%, 0.6–0.7× at 5%). The progressive codec still
-  rebuilds an FP16 cache, and prefill still builds the full cache once before compressing.
-- **Without the question, per-token precision alone is only slightly better than kvtc** (often tied at
-  8K tokens); the clear gains come from question scores and question-time refinement.
-- **Per-token precision can lose to uniform kvtc** when every token matters equally: on RULER-style
-  key-value retrieval (random UUIDs) kvtc scores 0.65–0.70 at 5% vs 0.35–0.55 for DimmerKV variants.
-  A floor at kvtc's precision plus question scores ties kvtc (0.65); the flat variant does not.
-- **The 3B model is near the ceiling** of our needle test at 2%, so methods are hard to separate there.
-  Multi-hop variable tracking is done (above); 8B and LongBench are next.
-- **Our kvtc is simplified**: greedy bit allocation instead of the paper's dynamic program, fixed groups
-  of 64, zlib on the CPU. The numbers are ours, not a reproduction of the paper.
-- **The recommended floor setting is only tested on the RULER-style tasks so far** (20 samples each);
-  the needle and perplexity tables above come from the earlier settings.
-- **Question-time refinement counts its fetch but does not move it yet**: the cold tier sits in the same
-  GPU tensors as the hot tier, so a real copy from host RAM or disk is not in the timings, and scoring
-  runs the question through the model once before answering.
-- **Small samples**: 18–36 questions or 20 RULER samples per setting, so differences of 1–2 answers
-  (about 0.1 on RULER) are noise.
+- **Small samples**: 18–36 needle questions or 20 RULER samples per setting, so differences of 1–2
+  answers (about 0.1 on RULER) are noise. Most runs use Llama-3.2-1B; 3B is a check; 8B and
+  LongBench are not done.
+- **Without the question, per-token precision is only slightly better than kvtc** (often tied at 8K
+  tokens). The clear gains come from question scores and question-time refinement.
+- **Dense lookups favour uniform precision**: on RULER-style key-value retrieval kvtc scores
+  0.65–0.70 at 5%; DimmerKV needs the floor at kvtc's level to tie it (0.65).
+- **Latency**: restoring a compressed chat (0.3–0.4 s on 8K tokens) is about 3× faster than
+  recomputing but slower than copying an uncompressed cache from RAM (48 ms). Answering directly over
+  the codes runs at 0.6–0.9× the speed of a rebuilt cache.
+- **Our kvtc is simplified** (greedy bit allocation, fixed groups of 64, zlib on the CPU); the numbers
+  are ours, not a reproduction of the paper. Question-time refinement counts its fetch but the cold
+  tier is not yet on a separate device.
+
+## Citation
+
+If DimmerKV is useful in your work, please cite it (GitHub's "Cite this repository" button uses
+[`CITATION.cff`](CITATION.cff)):
+
+```bibtex
+@software{dimmerkv2026,
+  title  = {DimmerKV: Per-Token Precision for KV Cache Compression in LLM Inference},
+  author = {Balaaji, Srikanth and B, Sushanth and Kiran, T S Sathya},
+  year   = {2026},
+  url    = {https://github.com/SrikanthBalaaji/Dimmer-KV}
+}
+```
 
 ## Credits
 
-- **kvtc**: Staniszewski & Łańcucki, *KV Cache Transform Coding for Compact Storage in LLM Inference*,
-  ICLR 2026. Cross-layer PCA, RoPE removal and grouped quantization come from this paper.
-- **H2O** (Zhang et al., NeurIPS 2023) and **SnapKV**: eviction baselines, and the attention-score ideas
-  behind our importance weights.
-- **Lexico**: sparse dictionary coding of KV vectors; our first codec and an ablation.
+- **kvtc**: Staniszewski & Łańcucki, *KV Cache Transform Coding for Compact Storage in LLM
+  Inference*, ICLR 2026. Cross-layer PCA, RoPE removal and grouped quantization come from this paper.
+- **H2O** (Zhang et al., NeurIPS 2023) and **SnapKV**: eviction baselines and the attention-score
+  ideas behind our importance weights.
+- **Lexico** (Kim et al., ICML 2025): sparse dictionary coding of KV vectors; our first codec and an
+  ablation.
 - **Loki** and **Mooncake**: score-then-fetch and tiered KV storage, which shaped question-time
   refinement and the hot/cold tiers.
+
+## Team
+
+Built in 24 hours at **Hashcode 14.0** (Track 01, LLM Inference, PES University, October 2026) by
+**Team Deadoop**: Srikanth Balaaji, Sushanth B, T S Sathya Kiran.

@@ -745,8 +745,8 @@ kvtc calibration for 3B (28,672 features per token) took 5.1 min.
   perplexity) and a 16K-token serving run are still running.
 
 
-AWS setup: `ubuntu@34.203.234.146` (g6e.2xlarge, L40S 46 GB), key
-`~/.ssh/hashcode-key.pem`. Our code in `~/dimmerkv` (copied with
+AWS setup (instance used during the hackathon only): g6e.2xlarge, L40S 46 GB,
+SSH key kept outside the repo. Our code in `~/dimmerkv` (copied with
 `git archive`), env `~/dimmerkv-env` (system PyTorch 2.14 + transformers
 5.20.2, datasets 5.1.0). Pipeline `~/dimmerkv/run_3b.sh` under nohup:
 fit_kvtc → fit_progressive → run_grid (8K, both modes + ppl) →

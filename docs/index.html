@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DimmerKV: KV Cache Compression for LLM Inference</title>
+<meta name="description" content="DimmerKV compresses the KV cache of large language models to 2-5% of its size (up to 56x smaller) while keeping full-cache accuracy. Per-token precision on transform coding, question-time refinement and attention over the compressed cache. PyTorch, Hugging Face, Llama 3.2.">
+<meta name="keywords" content="KV cache compression, LLM inference, KV cache, long context, H2O, SnapKV, kvtc, transform coding, quantization, PCA, Llama 3.2, PyTorch, Hugging Face Transformers, memory-efficient inference">
+<meta name="author" content="Srikanth Balaaji, Sushanth B, T S Sathya Kiran">
+<link rel="canonical" href="https://srikanthbalaaji.github.io/Dimmer-KV/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="DimmerKV: KV Cache Compression for LLM Inference">
+<meta property="og:description" content="37x smaller KV cache at full-cache accuracy. Eviction (H2O) answers 0/36; DimmerKV keeps 36/36 at the same 2% budget.">
+<meta property="og:url" content="https://srikanthbalaaji.github.io/Dimmer-KV/">
+<meta property="og:image" content="https://srikanthbalaaji.github.io/Dimmer-KV/social-preview.png">
+<meta property="og:image:width" content="1280">
+<meta property="og:image:height" content="640">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="DimmerKV: KV Cache Compression for LLM Inference">
+<meta name="twitter:description" content="37x smaller KV cache at full-cache accuracy; attention directly over the compressed cache.">
+<meta name="twitter:image" content="https://srikanthbalaaji.github.io/Dimmer-KV/social-preview.png">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareSourceCode",
+  "name": "DimmerKV",
+  "description": "KV cache compression for LLM inference: per-token precision on transform coding, question-time refinement and attention over the compressed cache.",
+  "codeRepository": "https://github.com/SrikanthBalaaji/Dimmer-KV",
+  "programmingLanguage": "Python",
+  "runtimePlatform": "PyTorch",
+  "keywords": "KV cache compression, LLM inference, long context, transform coding, H2O, kvtc",
+  "author": [
+    {"@type": "Person", "name": "Srikanth Balaaji"},
+    {"@type": "Person", "name": "Sushanth B"},
+    {"@type": "Person", "name": "T S Sathya Kiran"}
+  ],
+  "dateCreated": "2026-10-24"
+}
+</script>
+<style>
+  /* Layout: one centred reading column, wide breakout for the results table. Palette matches DimmerKV_overview.html. */
+  :root {
+    --bg: #fbfaf7; --surface: #ffffff; --sunk: #f3f1ec; --text: #1d1c1a; --muted: #5f5c55; --line: #dcd8cf;
+    --accent: #b7791f; --accent-soft: #fbefd9; --good: #2e7d4f; --bad: #b33a3a;
+    --f-body: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --f-mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+    --bg: #141413; --surface: #1c1c1a; --sunk: #232320; --text: #ecebe6; --muted: #a9a69d; --line: #3a3934;
+    --accent: #e3a548; --accent-soft: #3a2e1a; --good: #5cc48a; --bad: #ef7a68; color-scheme: dark; } }
+  :root[data-theme="dark"] {
+    --bg: #141413; --surface: #1c1c1a; --sunk: #232320; --text: #ecebe6; --muted: #a9a69d; --line: #3a3934;
+    --accent: #e3a548; --accent-soft: #3a2e1a; --good: #5cc48a; --bad: #ef7a68; color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.6 var(--f-body);
+         padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+  main { max-width: 1040px; margin: 0 auto; padding-block: 48px 64px; display: grid; gap: 48px; }
+  .col { max-width: 68ch; }
+  h1 { font-size: clamp(2.2rem, 6vw, 3.6rem); line-height: 1.05; margin: 0; letter-spacing: -0.02em; text-wrap: balance; }
+  h2 { font-size: 1.6rem; margin: 0 0 12px; text-wrap: balance; }
+  p { margin: 0; }
+  a { color: var(--accent); }
+  .eyebrow { font: 600 .75rem/1 var(--f-mono); letter-spacing: .12em; text-transform: uppercase; color: var(--accent); }
+  header { display: grid; gap: 18px; }
+  .lede { font-size: 1.2rem; color: var(--muted); max-width: 62ch; }
+  .buttons { display: flex; flex-wrap: wrap; gap: 10px; }
+  .btn { display: inline-block; padding: 10px 16px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface);
+         color: var(--text); text-decoration: none; font-weight: 600; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #1d1c1a; }
+  .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
+  .stat { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px; display: grid; gap: 6px; min-width: 0; }
+  .stat .v { font-size: 2rem; font-weight: 800; color: var(--accent); font-variant-numeric: tabular-nums; line-height: 1; }
+  .stat p { color: var(--muted); font-size: .92rem; }
+  .tbl { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; font-variant-numeric: tabular-nums; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; vertical-align: top; }
+  th { font: 600 .74rem var(--f-mono); letter-spacing: .05em; text-transform: uppercase; color: var(--muted); background: var(--sunk); }
+  td:first-child { white-space: normal; min-width: 180px; }
+  tr:last-child td { border-bottom: 0; }
+  tr.ours td { background: var(--accent-soft); font-weight: 600; }
+  .fail { color: var(--bad); font-weight: 700; }
+  .note { font-size: .85rem; color: var(--muted); }
+  ol.steps { margin: 0; padding-left: 1.3em; display: grid; gap: 10px; }
+  ol.steps li::marker { color: var(--accent); font-family: var(--f-mono); }
+  pre { background: var(--sunk); border: 1px solid var(--line); border-radius: 8px; padding: 14px; overflow-x: auto; margin: 0;
+        font: .85rem/1.55 var(--f-mono); }
+  footer { border-top: 1px solid var(--line); padding-top: 16px; color: var(--muted); font-size: .85rem; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <span class="eyebrow">Open source · PyTorch · Hugging Face Transformers</span>
+    <h1>DimmerKV: KV cache compression for LLM inference</h1>
+    <p class="lede">Dim the KV cache instead of deleting it. DimmerKV stores a language model's KV cache at 2–5% of its FP16 size and still answers questions about the compressed text as well as the uncompressed cache.</p>
+    <div class="buttons">
+      <a class="btn primary" href="https://github.com/SrikanthBalaaji/Dimmer-KV">Code on GitHub</a>
+      <a class="btn" href="DimmerKV_overview.html">Full write-up</a>
+      <a class="btn" href="https://github.com/SrikanthBalaaji/Dimmer-KV/blob/main/FINDINGS.md">All experiments</a>
+      <a class="btn" href="demo_backup.html">Recorded demo</a>
+    </div>
+  </header>
+
+  <section class="stats" aria-label="Headline results">
+    <div class="stat"><span class="v">37×</span><p>smaller KV cache with full-cache accuracy on facts asked after compression (Llama-3.2-1B, 8K tokens)</p></div>
+    <div class="stat"><span class="v">57×</span><p>more conversations per GiB of RAM, 18/18 answers correct (Llama-3.2-3B, 16K tokens)</p></div>
+    <div class="stat"><span class="v">0/36</span><p>answers for H2O eviction at the same 2% budget, where DimmerKV keeps 36/36 (3B, 8K)</p></div>
+    <div class="stat"><span class="v">8–14×</span><p>less GPU memory while answering, by running attention directly over the compressed cache</p></div>
+  </section>
+
+  <section>
+    <h2>The problem with KV cache eviction</h2>
+    <p class="col">A 16K-token conversation on Llama-3.2-3B needs 1.75 GB of KV cache. Eviction methods such as H2O and SnapKV keep the tokens that received the most attention and delete the rest. That fails when the question comes after compression: before the question exists, the facts it will need were never heavily attended. In our tests they sat at the 30–35th percentile of H2O's scores, so H2O deleted them.</p>
+  </section>
+
+  <section>
+    <h2>Results at the same memory budget</h2>
+    <div class="tbl">
+      <table>
+        <thead><tr><th>Method</th><th>Memory, 8K-token chat</th><th>Facts asked later</th><th>Multi-hop tracking</th><th>Exact lookup</th><th>First token</th></tr></thead>
+        <tbody>
+          <tr><td>Full cache, uncompressed</td><td>252 MiB</td><td>21/24</td><td>0.96</td><td>0.65</td><td>48 ms</td></tr>
+          <tr><td>Recompute from text</td><td>0</td><td>21/24</td><td>0.96</td><td>0.65</td><td>1,267 ms</td></tr>
+          <tr><td>H2O eviction</td><td>3%</td><td class="fail">0/24</td><td class="fail">0.11</td><td class="fail">0.00</td><td>35 ms</td></tr>
+          <tr><td>SnapKV eviction</td><td>3%</td><td class="fail">0/24</td><td class="fail">0.01</td><td class="fail">0.00</td><td>—</td></tr>
+          <tr><td>kvtc transform coding (ICLR 2026)</td><td>3%</td><td>19/24</td><td>0.81</td><td>0.70</td><td>—</td></tr>
+          <tr class="ours"><td>DimmerKV</td><td>3% · 6.8 MiB (37×)</td><td>21/24</td><td>0.90</td><td>0.65</td><td>437 ms</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">Llama-3.2-1B, RTX 5060 laptop GPU. Questions asked after compression. Needle test at 3% (24 questions); RULER-style multi-hop variable tracking at 8K, 3% and key-value lookup at 4K, 5% (20 samples each). Differences of 1–2 answers are within noise.</p>
+  </section>
+
+  <section>
+    <h2>How it works</h2>
+    <ol class="steps col">
+      <li><b>Transform once per model.</b> Undo RoPE on the keys, join all layers and heads into one vector per token, and fit one PCA basis (kvtc-style transform coding).</li>
+      <li><b>Give every token its own precision.</b> One byte budget is spent by error removed per byte, from dropped to fine bit-planes, with a floor at kvtc's precision and extra bytes for tokens the question attends to.</li>
+      <li><b>Store progressive bit-planes in tiers.</b> A hot tier holds the first planes; a cold tier holds the rest. Demote a conversation by dropping planes, with no re-encoding.</li>
+      <li><b>Refine when the question arrives.</b> Score the coarse cache with the question and fetch full precision for its top ~1% of tokens.</li>
+      <li><b>Answer from the codes.</b> Keys are rebuilt one layer at a time; values stay in coefficient space. The full FP16 cache never exists while answering.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>Try it</h2>
+<pre>git clone https://github.com/SrikanthBalaaji/Dimmer-KV.git
+cd Dimmer-KV
+pip install -r requirements.txt      # after installing PyTorch for your GPU
+hf auth login                        # Llama 3.2 is gated
+python scripts/fit_kvtc.py
+python scripts/fit_progressive.py
+python scripts/demo_app.py           # Gradio demo</pre>
+  </section>
+
+  <footer>
+    Built at Hashcode 14.0 (Track 01, LLM Inference, PES University) by Team Deadoop: Srikanth Balaaji, Sushanth B, T S Sathya Kiran.
+    Builds on kvtc (Staniszewski &amp; Łańcucki, ICLR 2026), H2O (NeurIPS 2023), SnapKV, Lexico, Loki and Mooncake.
+  </footer>
+</main>
+</body>
+</html>
