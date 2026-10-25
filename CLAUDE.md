@@ -835,3 +835,14 @@ GPU memory held per conversation 253 MB -> 18-31 MB at 2%; ~0.9x speed at 2%,
   weighting did not help. FINDINGS.md section 15.
 - `docs/demo_backup.html` from `scripts/demo_backup.py` (recorded demo scenarios).
 - Review 2 deck: https://claude.ai/artifact/BefpqPTgntqBAiG4ax3cm7 (private).
+
+## Progress log (2026-10-25, ~6:05 AM IST): deck, demo restyle, docs refresh
+
+- Review deck v8: idea / pipeline / progress slides describe the precision
+  floor as the default setting.
+- Demo restyled (HTML result cards, token-precision bar, neutral theme, no
+  emoji); `demo_backup.py` passes HTML cards through.
+- README and FINDINGS: recommended setting `dkvtc@b:snap:floor1`, updated
+  bottom line, open items, next steps, and two limits (floor setting only on
+  RULER-style tasks so far; refinement's cold-tier fetch is counted, not a
+  real host-to-GPU copy).

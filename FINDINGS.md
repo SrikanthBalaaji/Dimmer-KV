@@ -1,18 +1,18 @@
 # DimmerKV — experimental findings so far
 
-Status as of Sun 25 Oct 2026, ~4:10 AM IST. Model: Llama-3.2-1B-Instruct (FP16,
+Status as of Sun 25 Oct 2026, ~6:05 AM IST. Model: Llama-3.2-1B-Instruct (FP16,
 16 layers, 8 KV heads, head dim 64) on the LOQ laptop (RTX 5060 8 GB).
-Branch: `codec-rework`. Raw numbers and the run-by-run log are in `CLAUDE.md`;
+Branch: `main` (kept identical to `codec-rework`). Raw numbers and the run-by-run log are in `CLAUDE.md`;
 logs in `logs/` (not committed); grid results as CSV in `results/`.
 
-## Recap of all testing (Sat 24 Oct 3 PM → Sun 25 Oct 4:10 AM)
+## Recap of all testing (Sat 24 Oct 3 PM → Sun 25 Oct 6 AM)
 
 Runs on Llama-3.2-1B-Instruct, RTX 5060 laptop (8 GB), unless marked
 3B (Llama-3.2-3B-Instruct on an AWS L40S). Main test: hidden
 4-digit facts ("needles") in WikiText; the cache is compressed, then each
 question is asked; plus perplexity, timing, and real storage size.
 "X%" = compressed cache size as a share of the normal FP16 cache
-(3% ≈ 33× smaller). Details per step are in sections 1–10 below.
+(3% ≈ 33× smaller). Details per step are in sections 1–15 below.
 
 | # | what we tested | result |
 |---|---|---|
@@ -54,12 +54,20 @@ question is asked; plus perplexity, timing, and real storage size.
 - DimmerKV's per-token precision on kvtc adds a consistent gain at short
   contexts and a clear gain when the question is visible (matches the full
   cache at 3% on 8K tokens); without the question it ties kvtc at 8K.
-- Savings are in storage and transfer (RAM, disk, network); GPU memory and
-  generation speed during answering are unchanged (Level 1).
+- Savings are in storage and transfer (RAM, disk, network), and, with
+  attention run directly over the codes (section 13), in GPU memory while
+  answering (253 MB → 18–31 MB at 2%, same answers, ~0.9× speed).
+- On RULER-style tasks DimmerKV leads kvtc on variable tracking but per-token
+  precision alone lost on dense key-value lookups; a floor at kvtc's precision
+  plus question scores (`dkvtc@b:snap:floor1`, section 15) ties kvtc there and
+  keeps the lead. This is the recommended setting.
 
-**Open items**: rest of the AWS 3B grid (question in prompt, perplexity),
-3B 16K serving rerun with the faster decode, 8B, byte storage for evicted
-tokens, refinement in the serving benchmark, harder multi-hop needles.
+**Open items**: the recommended setting (`:snap:floor1`) on the needle test
+and perplexity; a budget sweep with 50+ samples per cell and confidence
+intervals; an ablation table (transform, per-token precision, question
+scores, floor, eviction); 8B; a real cold-tier transfer in the serving
+benchmark; attention over the codes for the progressive codec. See "Next
+steps" below.
 
 ## TL;DR
 
@@ -67,7 +75,12 @@ Current best system: **DimmerKV on kvtc** — kvtc-style transform coding
 (cross-layer PCA with RoPE removed, grouped 0/2/4/8-bit quantization) as the
 codec, with DimmerKV choosing a precision rung per token under one byte budget,
 by error per byte (`flat`) or weighted by question-window attention when the
-question is visible (`snap`). Sections 6–8.
+question is visible (`snap`). Sections 6–8. Recommended setting:
+`dkvtc@b:snap:floor1`: every token first gets kvtc's uniform precision, then
+the leftover bytes go by question score (section 15), which is never worse
+than kvtc on the tasks tested. Options built on top: an eviction level
+(section 12), progressive tiers with question-time refinement (section 11),
+and attention directly over the codes (section 13).
 
 1. **kvtc-style coding changes the scale.** At 3–5% of FP16 KV memory
    (20–33×), it keeps 22–24/24 needles and perplexity within 1–2% of the full
@@ -904,24 +917,32 @@ Variable tracking 8K, 3% with the same floor:
   cache. Prefill still builds the full cache once before compressing.
 - `dkvtc:snap` in the "question after compression" mode uses the last 32
   context tokens as its window (no question); its gains there are small.
+- The recommended setting (`:snap:floor1`) has so far been run only on the
+  RULER-style tasks (20 samples each); the needle and perplexity numbers in
+  sections 7–12 come from the earlier settings.
+- Question-time refinement keeps the cold tier in the same GPU tensors as the
+  hot tier: fetched bytes are counted and the decode is timed, but a real copy
+  from host RAM or disk is not yet measured. Scoring also runs the question
+  through the model once more before answering.
 
 ## Next steps (proposed)
 
-1. **Bigger models on AWS**: kvtc calibration for 3B/8B on the GPU with a
-   truncated basis (~10K components, as in the paper: 8B has 32,768 features
-   per token), then `run_grid.py` with the kvtc family at 2–5% on 4–8K
-   contexts and 50+ needles.
-2. **Eviction as a rung**: a zero-byte option in the ladder so DimmerKV can
-   drop clearly useless tokens at extreme budgets (kvtc lists eviction as
-   future work).
-3. ~~Refine on demand~~ built as progressive tiers (section 11). Next:
-   time the cold-tier fetch in the serving benchmark, and test refinement
-   on harder tasks and on 3B/8B.
-4. **Harder tests**: multi-hop needles (variable tracking), longer contexts,
-   LongBench subset with the question in the prompt.
-5. **Demo and pitch**: "kvtc compresses every token alike; DimmerKV decides
-   per token". Heat map of rungs per token; storage size / restore time vs
-   recompute; H2O failing after compression.
+Done from the earlier list: eviction as a zero-byte level (section 12),
+refinement on demand as progressive tiers (section 11), multi-hop variable
+tracking (section 14), 3B on AWS (sections 11–12), the demo.
+
+1. **Make the recommended setting's case robust**: `:snap:floor1` vs kvtc at
+   budgets of 2–10%, 50+ samples per cell with confidence intervals, on the
+   needle test, both RULER-style tasks and perplexity.
+2. **Ablation table**: add one part at a time (transform, per-token
+   precision, question scores, floor, eviction) on the same tests.
+3. **8B on AWS** (Llama-3.1-8B, 32,768 features per token, ~14% more than
+   3B; calibration ~8–10 min expected), then 3B/8B with the floor setting.
+4. **Real cold tier**: keep cold planes in host RAM, time the copy of the
+   refined tokens in the serving benchmark.
+5. **Attention over the codes for the progressive codec**, and compression
+   streamed during prefill so the full cache never exists.
+6. **A real-document benchmark** (two LongBench tasks) if time allows.
 
 ## Reproduce
 
@@ -940,6 +961,7 @@ $py = "$env:USERPROFILE\.venvs\hashcode\Scripts\python.exe"
 & $py scripts\bench_memory.py                    # memory / time / accuracy table
 & $py scripts\fit_progressive.py                 # checkpoints\progressive.pt (after fit_kvtc.py)
 & $py scripts\test_generation.py --context-tokens 8000 --configs kvtcf@0.02 prog@0.02 prog@0.02:r0.01
+& $py scripts\eval_ruler.py --task kv --context-tokens 4000 --configs kvtcf@0.05 dkvtc@0.05:snap:floor1
 # Diagnostics
 & $py scripts\bench_codecs.py                    # PCA vs Lexico error, bytes, time
 & $py scripts\diagnose_scores.py                 # needle rank under H2O scores

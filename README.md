@@ -48,6 +48,9 @@ and a single byte budget is spent where it removes the most error.
    upgrades greedily by error removed per byte, from "dropped" (0 bytes) through coarse to fine bit-planes.
    - Without the question, tokens are weighted equally (**flat**): bytes go to tokens that are hard to compress.
    - With the question in the prompt, errors are weighted by the **question's attention**, so relevant tokens get finer precision.
+   - **Recommended setting (`dkvtc@b:snap:floor1`)**: every token first gets kvtc's uniform precision (a
+     floor), and only the leftover bytes are spent by question score. This is never worse than kvtc on
+     the tasks we tested.
    - The first 4 and last 32 tokens stay exact.
 3. **Store in tiers.** Bit-pack and DEFLATE. A **hot** tier holds each token's first bit-planes; a **cold**
    tier holds the rest. Under memory pressure a conversation is demoted by dropping planes, with no
@@ -73,6 +76,9 @@ and a single byte budget is spent where it removes the most error.
 Specific contributions:
 - **Per-token precision on top of transform coding.** kvtc gives every token the same bits; DimmerKV
   allocates bit-planes per token under one budget and beats kvtc at equal bytes.
+- **A precision floor at kvtc's level.** Per-token precision alone lost to kvtc on dense lookups where
+  every token matters equally; giving every token kvtc's precision first and spending only the leftover
+  by question score ties kvtc there and keeps the lead on multi-hop tracking.
 - **Eviction as a precision level.** A zero-byte level lets one allocator mix dropping and graded
   precision. With question scores this matched the full cache at 1.5–2% of its memory.
 - **Progressive bit-plane coding.** Nested 8-bit codes ordered by error per byte are 10–30% more
@@ -186,6 +192,7 @@ $py = "$env:USERPROFILE\.venvs\hashcode\Scripts\python.exe"
 & $py scripts\eval_perplexity.py --configs kvtcf@0.03 dkvtc@0.03:snap h2o:0.03
 & $py scripts\bench_serving.py --context-tokens 8000 --methods h2o:0.02 kvtcf@0.02 dkvtc@0.02
 & $py scripts\eval_ruler.py --task vt --context-tokens 8000 --configs kvtcf@0.03 dkvtc@0.03:snap:ev h2o:0.03
+& $py scripts\eval_ruler.py --task kv --context-tokens 4000 --configs kvtcf@0.05 dkvtc@0.05:snap:floor1
 & $py scripts\test_compressed_attention.py --context-tokens 8000 --methods kvtcf@0.02 dkvtc@0.02
 & $py scripts\run_grid.py --model meta-llama/Llama-3.2-1B-Instruct --budgets 0.02 0.05 --templates "h2o:{b}" "kvtcf@{b}" "dkvtc@{b}"
 ```
@@ -204,7 +211,7 @@ the top of [`scripts/methods.py`](scripts/methods.py).
 | `scripts/compressed_attention.py` | attention directly over the compressed cache (keys per layer, values never decoded) |
 | `scripts/methods.py` | one name per method, shared by every script and the demo |
 | `scripts/test_generation.py`, `eval_perplexity.py`, `bench_serving.py`, `bench_memory.py`, `run_grid.py` | needle tests, perplexity, serving benchmark, storage/time benchmark, CSV grid runner |
-| `scripts/demo_app.py` | Gradio demo: side-by-side methods, all-methods leaderboard, per-token heat map |
+| `scripts/demo_app.py`, `demo_backup.py` | Gradio demo (scenarios, side-by-side result cards, all-methods leaderboard, per-token heat map) and its static backup |
 | `scripts/lexico.py`, `pca_codec.py`, … | earlier codecs, kept as ablations |
 | `docs/DimmerKV_overview.html` | overview page with the architecture diagram |
 | `FINDINGS.md`, `results/` | every experiment, and the raw result CSVs |
@@ -220,10 +227,16 @@ the top of [`scripts/methods.py`](scripts/methods.py).
   key-value retrieval (random UUIDs) kvtc scores 0.65–0.70 at 5% vs 0.35–0.55 for DimmerKV variants.
   A floor at kvtc's precision plus question scores ties kvtc (0.65); the flat variant does not.
 - **The 3B model is near the ceiling** of our needle test at 2%, so methods are hard to separate there.
-  8B and harder tasks (multi-hop, LongBench) are next.
+  Multi-hop variable tracking is done (above); 8B and LongBench are next.
 - **Our kvtc is simplified**: greedy bit allocation instead of the paper's dynamic program, fixed groups
   of 64, zlib on the CPU. The numbers are ours, not a reproduction of the paper.
-- **Small samples**: 18–36 questions per setting, so differences of 1–2 answers are noise.
+- **The recommended floor setting is only tested on the RULER-style tasks so far** (20 samples each);
+  the needle and perplexity tables above come from the earlier settings.
+- **Question-time refinement counts its fetch but does not move it yet**: the cold tier sits in the same
+  GPU tensors as the hot tier, so a real copy from host RAM or disk is not in the timings, and scoring
+  runs the question through the model once before answering.
+- **Small samples**: 18–36 questions or 20 RULER samples per setting, so differences of 1–2 answers
+  (about 0.1 on RULER) are noise.
 
 ## Credits
 
