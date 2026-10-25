@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>DimmerKV: KV Cache Compression for LLM Inference</title>
-<meta name="description" content="DimmerKV compresses the KV cache of large language models to 2-5% of its size (up to 56x smaller) while keeping full-cache accuracy. Per-token precision on transform coding, question-time refinement and attention over the compressed cache. PyTorch, Hugging Face, Llama 3.2.">
+<meta name="description" content="DimmerKV compresses the KV cache of large language models to 3-5% of its size (20-37x smaller) while keeping full-cache accuracy. Per-token precision on transform coding, question-time refinement and attention over the compressed cache. PyTorch, Hugging Face, Llama 3.2.">
 <meta name="keywords" content="KV cache compression, LLM inference, KV cache, long context, H2O, SnapKV, kvtc, transform coding, quantization, PCA, Llama 3.2, PyTorch, Hugging Face Transformers, memory-efficient inference">
 <meta name="author" content="Srikanth Balaaji, Sushanth B, T S Sathya Kiran">
 <link rel="canonical" href="https://srikanthbalaaji.github.io/Dimmer-KV/">
@@ -93,7 +93,7 @@
   <header>
     <span class="eyebrow">Open source · PyTorch · Hugging Face Transformers</span>
     <h1>DimmerKV: KV cache compression for LLM inference</h1>
-    <p class="lede">Dim the KV cache instead of deleting it. DimmerKV stores a language model's KV cache at 2–5% of its FP16 size and still answers questions about the compressed text as well as the uncompressed cache.</p>
+    <p class="lede">Dim the KV cache instead of deleting it. DimmerKV stores a language model's KV cache at 3–5% of its FP16 size (20–37× smaller) and still answers questions about the compressed text as well as the uncompressed cache; at 2% it keeps most answers.</p>
     <div class="buttons">
       <a class="btn primary" href="https://github.com/SrikanthBalaaji/Dimmer-KV">Code on GitHub</a>
       <a class="btn" href="DimmerKV_overview.html">Full write-up</a>

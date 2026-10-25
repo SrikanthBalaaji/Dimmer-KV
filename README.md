@@ -1,8 +1,8 @@
 # DimmerKV: KV cache compression for LLM inference
 
 **Dim the KV cache instead of deleting it.** DimmerKV compresses a language model's KV cache to
-2–5% of its FP16 size (20–56× smaller) and still answers questions about the compressed text as well
-as the uncompressed cache. Instead of evicting tokens like H2O or SnapKV, it keeps **every token at a
+3–5% of its FP16 size (20–37× smaller) and still answers questions about the compressed text as well
+as the uncompressed cache; at 2% (56× smaller) it keeps most answers. Instead of evicting tokens like H2O or SnapKV, it keeps **every token at a
 precision chosen for that token**, sharpens the tokens a new question needs, and can run attention
 directly over the compressed cache.
 
@@ -70,6 +70,9 @@ flowchart LR
 5. **Answer from the codes.** Keys are rebuilt one layer at a time and discarded; values stay in
    coefficient space (attention weights the coefficients, then applies the basis once per head).
    Answers match the fully decoded cache.
+
+Today steps 3–4 run in the progressive mode (`prog@b:r0.01`), and the floor of step 2 and step 5 run
+in the standard mode (`dkvtc@b:snap:floor1`); combining them is the next step.
 
 ## What is new
 
@@ -184,7 +187,7 @@ GPU memory 70 MiB instead of 506 MiB, at 29 instead of 46 tokens/s. Source: `res
 | kvtc | 0.82 | 0.82 | **0.70** |
 | DimmerKV + question scores + eviction | **0.92** | 0.84 | 0.40 |
 | DimmerKV progressive + refine top 1% | 0.87 | **0.87** | 0.55 |
-| **DimmerKV + question scores + floor at kvtc's level** | 0.91 | **0.90** | **0.65** |
+| **DimmerKV + question scores + floor at kvtc's level** | 0.91 | 0.90 at 3% (not run at 2%) | **0.65** |
 
 Perplexity, 3B, 8K tokens (full cache 8.33, lower is better):
 
@@ -276,7 +279,12 @@ documented at the top of [`scripts/methods.py`](scripts/methods.py). The recomme
   0.65–0.70 at 5%; DimmerKV needs the floor at kvtc's level to tie it (0.65).
 - **Latency**: restoring a compressed chat (0.3–0.4 s on 8K tokens) is about 3× faster than
   recomputing but slower than copying an uncompressed cache from RAM (48 ms). Answering directly over
-  the codes runs at 0.6–0.9× the speed of a rebuilt cache.
+  the codes runs at 0.5–0.9× the speed of a rebuilt cache; the rebuild path itself needs about 1.6 GiB
+  of temporary GPU memory at 8K tokens (0.6 GiB for the uncompressed cache).
+- **At 2% the floor cannot act** (kvtc only affords its coarsest step), so the final setting scores
+  16/24 vs kvtc's 17/24 there; refinement is the better 2% option (19/24).
+- **21/24 is the 1B model's own ceiling at 8K tokens**: the uncompressed cache, and plain Hugging Face
+  generation without any of our code, miss the same 3 questions (all the same needle).
 - **Our kvtc is simplified** (greedy bit allocation, fixed groups of 64, zlib on the CPU); the numbers
   are ours, not a reproduction of the paper. Question-time refinement counts its fetch but the cold
   tier is not yet on a separate device.
