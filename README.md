@@ -11,6 +11,7 @@ directly over the compressed cache.
 [![Hugging Face Transformers](https://img.shields.io/badge/%F0%9F%A4%97%20Transformers-5.20-FFD21E)](https://github.com/huggingface/transformers)
 [![Models: Llama 3.2](https://img.shields.io/badge/models-Llama%203.2%201B%20%7C%203B-6E56CF)](https://huggingface.co/meta-llama)
 [![Hashcode 14.0](https://img.shields.io/badge/Hashcode%2014.0-Track%2001%20LLM%20Inference-2E7D4F)](#team)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 **Project page:** [srikanthbalaaji.github.io/Dimmer-KV](https://srikanthbalaaji.github.io/Dimmer-KV/) ·
 **Full write-up:** [`docs/DimmerKV_overview.html`](docs/DimmerKV_overview.html) ·
@@ -288,6 +289,12 @@ documented at the top of [`scripts/methods.py`](scripts/methods.py). The recomme
 - **Our kvtc is simplified** (greedy bit allocation, fixed groups of 64, zlib on the CPU); the numbers
   are ours, not a reproduction of the paper. Question-time refinement counts its fetch but the cold
   tier is not yet on a separate device.
+
+## License
+
+[MIT](LICENSE) © 2026 Srikanth Balaaji, Sushanth B, T S Sathya Kiran. The license covers our code. The
+methods we build on (kvtc, H2O, SnapKV, Lexico) belong to their authors and are credited below; Llama
+3.2 weights are under Meta's Llama 3.2 Community License and are not part of this repository.
 
 ## Citation
 
