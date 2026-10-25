@@ -97,6 +97,41 @@ size as a share of the FP16 KV cache (2% = 50× smaller). "ans p" is the model's
 of the correct answer. The test hides facts such as *"The access code for the Orion locker is 7311"*
 in WikiText and asks about them.
 
+**Head to head: H2O alone, Lexico alone, DimmerKV** (1B, ~3.1K-token conversations, FP16 cache
+96 MiB, 24 questions asked after compression, RTX 5060 laptop; `results/memory_time_accuracy.csv`,
+`results/serving.csv`)
+
+| method | stored per conversation | smaller by | conversations in 8 GiB RAM | compress | restore | first answer token | tokens/s | correct | perplexity |
+|---|---|---|---|---|---|---|---|---|---|
+| Full cache in RAM | 96.3 MiB | 1× | 85 | — | 5 ms | 25 ms | 64 | 24/24 | 11.32 |
+| Recompute from the text | ~0 | — | unlimited | — | 840 ms (prefill) | 891 ms | 61 | 24/24 | 11.32 |
+| H2O 5% | 4.9 MiB | 20× | 1,685 | 28 ms | <1 ms\* | 22 ms | 58 | 0/24 | 12.72 |
+| H2O 10% | 9.7 MiB | 10× | 846 | 30 ms | <1 ms\* | 22 ms | 60 | 0/24 | 12.29 |
+| Lexico 10% (uniform) | 9.2 MiB† | 10× | ~890† | 362 ms | ~30–45 ms‡ | — | — | 0/24 | 13.90 |
+| **DimmerKV 3%** | **2.6 MiB** | **37×** | **3,127** | 348 ms | 154 ms | 176 ms | 61 | **23/24** | **11.58** |
+| **DimmerKV 5%** | 4.3 MiB | 22× | 1,896 | 360 ms | 166 ms | 188 ms | 64 | **24/24** | **11.45** |
+
+DimmerKV here is the question-unaware setting (`dkvtc@b`, sizes after bit-packing and DEFLATE).
+\* H2O's restore only copies its kept tokens; its cache layout is simulated, so this is a lower bound.
+† Lexico's size is counted from its codes (no byte format written); conversations computed from it.
+‡ Lexico decode time from the codec benchmark (9–15 ms per 1K tokens); Lexico was not in the serving
+benchmark, so it has no first-token or tokens/s figure.
+
+- **Speed: H2O is fastest.** It only drops tokens (about 30 ms to compress, 22 ms to the first token).
+  DimmerKV takes about 0.35 s to compress and 0.18 s to the first token, still about 5× faster than
+  re-reading the conversation. Lexico compresses at about the same speed as DimmerKV at this length,
+  but its sparse search (OMP) grows with the number of atoms (0.35–0.67 s per 1K tokens at 8–16 atoms).
+  Generation speed is the same for all methods (58–65 tokens/s), because answering here uses a normal
+  FP16 cache.
+- **Memory: DimmerKV is smallest and the only one that keeps the answers.** At 3% it stores less than
+  H2O at 5% or Lexico at 10%, fits 1.9× and 3.5× more conversations than them, answers 23/24 and stays
+  within 2.3% of full perplexity. H2O and Lexico answer 0/24 at these sizes. H2O failed at every budget
+  we tried up to 20% when the question comes later; uniform Lexico needed 22–27% of FP16 to answer
+  10–16 of 18 (1.6K tokens).
+- **GPU memory while answering** (8K tokens, 2%): H2O holds only its kept tokens (about 5 MiB);
+  DimmerKV answering directly over the codes holds 18–31 MB, against 253 MB for the full cache. H2O is
+  smaller here, but it has deleted the facts.
+
 **Question known before compression** (8K-token documents)
 
 | method | 1B, 1.5% | 1B, 2% | 3B, 2% |
