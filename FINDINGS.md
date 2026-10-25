@@ -943,9 +943,10 @@ progressive + refine top 1% 19/24 / .673 and 20/24 / .688.
   space vs 0.6 GiB for the full cache. Answering directly over the codes fixes
   this (peak 70 MiB, 7× less) at about half the generation speed here.
 - **Direct mode at 2% held 181 MiB**, far above the 18–31 MB measured for
-  plain DimmerKV in section 13: the floor + question-score mix spreads tokens
-  over many precision steps, and our block merging then stores rare wide
-  blocks at full width. To fix: merge blocks by bytes, not by count.
+  plain DimmerKV in section 13. Likely cause (not yet checked): the floor +
+  question-score mix spreads tokens over many precision steps, and merging
+  small blocks stores them at the widest member's width. To check, then fix
+  by merging blocks by bytes.
 - Laptop timings at 8K are under GPU memory pressure: the scoring prefill
   (eager attention) took 7.4 s per conversation (SDPA recompute: 1.2 s), and
   compression 1.5–2.5 s vs ~0.35 s at 3K tokens.
