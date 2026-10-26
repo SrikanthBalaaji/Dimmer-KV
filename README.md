@@ -16,6 +16,7 @@ directly over the compressed cache.
 **Project page:** [srikanthbalaaji.github.io/Dimmer-KV](https://srikanthbalaaji.github.io/Dimmer-KV/) ·
 **Full write-up:** [`docs/DimmerKV_overview.html`](docs/DimmerKV_overview.html) ·
 **Every experiment:** [`FINDINGS.md`](FINDINGS.md)
+· **Use it in vLLM or transformers:** [`PLUGIN.md`](PLUGIN.md)
 
 | | |
 |---|---|

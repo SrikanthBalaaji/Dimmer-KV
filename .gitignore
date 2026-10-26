@@ -30,3 +30,7 @@ logs/
 
 # Papers (copyrighted; link to them instead of committing)
 *.pdf
+
+# Packaging / tests
+*.egg-info/
+.pytest_cache/

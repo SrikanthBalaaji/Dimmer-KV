@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dimmerkv"
+version = "0.1.0"
+description = "Per-token-precision KV cache compression for chat serving and stored conversations (vLLM connector, Hugging Face integration)."
+readme = "PLUGIN.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Srikanth Balaaji" }, { name = "Sushanth B" }, { name = "T S Sathya Kiran" }]
+dependencies = ["torch>=2.4", "numpy"]
+
+[project.optional-dependencies]
+hf = ["transformers>=4.56", "accelerate"]
+calibrate = ["transformers>=4.56", "datasets"]
+vllm = ["vllm"]
+test = ["pytest", "transformers>=4.56"]
+
+[project.scripts]
+dimmerkv = "dimmerkv.cli:main"
+
+[project.entry-points."vllm.general_plugins"]
+dimmerkv = "dimmerkv.integrations.vllm:register"
+
+[tool.setuptools.packages.find]
+include = ["dimmerkv*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
