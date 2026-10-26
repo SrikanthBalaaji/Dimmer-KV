@@ -41,20 +41,23 @@ at the 30–35th percentile of H2O's attention scores, so H2O deleted them.
 ## How it works
 
 ```mermaid
-flowchart LR
-    A[Document or conversation] --> B[Prefill<br/>Llama 3.2]
-    B --> C[FP16 KV cache]
-    C --> D[Transform<br/>undo RoPE, cross-layer PCA]
-    D --> E[DimmerKV allocator<br/>precision per token<br/>under one byte budget]
-    E --> F[Progressive bit-planes]
-    F --> G[(Hot tier<br/>first bit-planes)]
-    F --> H[(Cold tier<br/>remaining planes, DEFLATE)]
-    Q[New question] --> I[Score the coarse cache]
-    G --> I
-    I -- fetch top ~1% of tokens --> H
-    G --> J[Attention over the codes<br/>keys per layer, values never decoded]
-    H --> J
-    J --> K[Answer]
+%%{init: {"themeVariables": {"fontSize": "18px"}, "flowchart": {"nodeSpacing": 30, "rankSpacing": 35}}}%%
+flowchart TB
+    subgraph S1 ["1 · Compress once per conversation"]
+        direction LR
+        A[Document or<br/>conversation] --> B[Prefill<br/>Llama 3.2] --> C[FP16<br/>KV cache] --> D[Transform<br/>undo RoPE,<br/>cross-layer PCA]
+    end
+    subgraph S2 ["2 · Choose precision per token and store"]
+        direction LR
+        E[DimmerKV allocator<br/>precision per token,<br/>one byte budget] --> F[Progressive<br/>bit-planes]
+        F --> G[(Hot tier<br/>first bit-planes)]
+        F --> H[(Cold tier<br/>remaining planes,<br/>DEFLATE)]
+    end
+    subgraph S3 ["3 · Answer a new question"]
+        direction LR
+        I([New question:<br/>score the hot tier]) --> R[Fetch top ~1%<br/>of tokens from<br/>the cold tier] --> J[Attention<br/>over the codes] --> K([Answer])
+    end
+    S1 --> S2 --> S3
 ```
 
 1. **Calibrate once per model** (kvtc-style transform coding). Undo RoPE on the keys, join all layers
